@@ -1,0 +1,325 @@
+From 1b48f2180a3e493d2a958f9f546b436e567d86fc Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:42:45 -0400
+Subject: [PATCH 2/4] Add canonical per-question fingerprint and
+ render-contract incremental staging
+
+---
+ src/sotoki/posts.py | 243 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 241 insertions(+), 2 deletions(-)
+
+diff --git a/src/sotoki/posts.py b/src/sotoki/posts.py
+index 20222ff..b148f94 100644
+--- a/src/sotoki/posts.py
++++ b/src/sotoki/posts.py
+@@ -1,6 +1,10 @@
+ #!/usr/bin/env python
+ import datetime
++import hashlib
++import json
++import os
+ import re
++import threading
+ from typing import Any
+ 
+ from pathlib import Path
+@@ -12,6 +16,25 @@ from sotoki.utils.generator import Generator, Walker
+ from sotoki.utils.html import get_slug_for
+ from sotoki.utils.shared import context, logger, shared
+ 
++# Bump whenever the set of renderer-consumed fields changes: pages rendered
++# under an older contract must be re-rendered even when the source is unchanged.
++RENDER_CONTRACT_VERSION = "1"
++
++# Render contract (A4): every field the renderer may consume. Pages are
++# fingerprinted over exactly these fields; anything else is ignored.
++_FINGERPRINT_QUESTION_FIELDS = (
++    "Id", "Title", "Body", "Score", "Tags", "OwnerUserId", "OwnerDisplayName",
++    "CreationDate", "LastActivityDate", "ViewCount", "LastEditDate",
++    "LastEditorUserId", "AcceptedAnswerId",
++)
++_FINGERPRINT_COMMENT_FIELDS = (
++    "Id", "PostId", "UserId", "Score", "Text", "CreationDate", "ContentLicense",
++)
++_FINGERPRINT_ANSWER_FIELDS = (
++    "Id", "Score", "Body", "OwnerUserId", "OwnerDisplayName", "CreationDate",
++    "LastEditDate", "LastEditorUserId",
++)
++
+ 
+ def harmonize_post(post: dict):
+     post["has_accepted"] = "AcceptedAnswerId" in post
+@@ -27,6 +50,77 @@ def harmonize_post(post: dict):
+     post["Tags"] = re.split(r"\||><", post["Tags"][1:-1])
+ 
+ 
++def _normalize_tags(tags: Any):
++    """Normalize Tags (raw dump string or post-harmonize list) to a sorted list."""
++    if tags is None:
++        return None
++    if isinstance(tags, str):
++        if len(tags) >= 2 and tags[0] in "<|" and tags[-1] in ">|":
++            tags = re.split(r"\||><", tags[1:-1])
++        else:
++            tags = tags.split("|")
++    return sorted(str(tag) for tag in tags)
++
++
++def _fingerprint_comment(comment: dict) -> dict:
++    return {field: comment.get(field) for field in _FINGERPRINT_COMMENT_FIELDS}
++
++
++def _fingerprint_answer(answer: dict) -> dict:
++    fingerprint = {field: answer.get(field) for field in _FINGERPRINT_ANSWER_FIELDS}
++    fingerprint["comments"] = [
++        _fingerprint_comment(comment)
++        for comment in sorted(
++            answer.get("comments") or [], key=lambda c: int(c.get("Id") or 0)
++        )
++    ]
++    return fingerprint
++
++
++def fingerprint_post(post: dict) -> str:
++    """Canonical SHA-256 over every renderer-consumed field (render contract).
++
++    Permutation-invariant: answers/comments/links are sorted by Id, Tags are
++    sorted, and json keys are sorted. Any change in a contracted field changes
++    the digest; fields the renderer does not consume are ignored (A4).
++    """
++    data = {field: post.get(field) for field in _FINGERPRINT_QUESTION_FIELDS}
++    data["Tags"] = _normalize_tags(data["Tags"])
++    data["comments"] = [
++        _fingerprint_comment(comment)
++        for comment in sorted(
++            post.get("comments") or [], key=lambda c: int(c.get("Id") or 0)
++        )
++    ]
++    data["answers"] = [
++        _fingerprint_answer(answer)
++        for answer in sorted(
++            post.get("answers") or [], key=lambda a: int(a.get("Id") or 0)
++        )
++    ]
++    links = post.get("links") or {}
++    all_links = list(links.get("linked") or []) + list(links.get("duplicate") or [])
++    data["links"] = [
++        dict(sorted(link.items()))
++        for link in sorted(all_links, key=lambda link: int(link.get("Id") or 0))
++    ]
++    canonical = json.dumps(
++        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
++    )
++    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++
++
++def should_skip_render(existing_manifest, fingerprint: str) -> bool:
++    """Pure decision helper: skip re-render when contract and source match."""
++    if not isinstance(existing_manifest, dict):
++        return False
++    if existing_manifest.get("schema_version") != 2:
++        return False
++    if existing_manifest.get("render_contract_version") != RENDER_CONTRACT_VERSION:
++        return False
++    return existing_manifest.get("source_sha256") == fingerprint
++
++
+ class WalkerWithTrigger(Walker):
+     def startDocument(self):  # noqa: N802
+         self.seen = 0
+@@ -285,6 +379,11 @@ class PostsWalker(WalkerWithTrigger):
+ 
+ 
+ class PostGenerator(Generator):
++    # Number of items that failed during this pass (H2 prune gate). Incremented
++    # from worker threads, read by the scraper before pruning is allowed.
++    failures = 0
++    failures_lock = threading.Lock()
++
+     @property
+     def walker(self):
+         return PostsWalker
+@@ -293,7 +392,63 @@ class PostGenerator(Generator):
+     def fpath(self):
+         return shared.build_dir / "posts_complete.xml"
+ 
++    def acquire_incremental_lock(self):
++        """H1: exclusive stage-root lock; reject concurrent incremental runs.
++
++        Uses flock on stage_root/.incremental.lock on POSIX (with pid recorded)
++        and an O_EXCL pid lockfile elsewhere.
++        """
++        stage_root = Path(context.stage_dir)
++        stage_root.mkdir(parents=True, exist_ok=True)
++        lock_path = stage_root / ".incremental.lock"
++        if os.name == "posix":
++            import fcntl
++
++            lock_handle = open(lock_path, "a+")
++            try:
++                fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except OSError as exc:
++                lock_handle.close()
++                raise RuntimeError(
++                    f"Another incremental run holds {lock_path}; "
++                    "concurrent runs are rejected"
++                ) from exc
++            lock_handle.seek(0)
++            lock_handle.truncate()
++            lock_handle.write(f"{os.getpid()}\n")
++            lock_handle.flush()
++            return lock_handle
++        # portable fallback: O_EXCL lockfile carrying the pid
++        try:
++            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++        except FileExistsError as exc:
++            raise RuntimeError(
++                f"Another incremental run holds {lock_path}; "
++                "concurrent runs are rejected"
++            ) from exc
++        os.write(fd, f"{os.getpid()}\n".encode())
++        return fd
++
++    def release_incremental_lock(self, lock_handle):
++        """H1: release the stage-root lock acquired by acquire_incremental_lock."""
++        if lock_handle is None:
++            return
++        if os.name == "posix":
++            import fcntl
++
++            try:
++                fcntl.flock(lock_handle, fcntl.LOCK_UN)
++            finally:
++                lock_handle.close()
++        else:
++            os.close(lock_handle)
++            try:
++                (Path(context.stage_dir) / ".incremental.lock").unlink()
++            except OSError:
++                pass
++
+     def run(self):
++        PostGenerator.failures = 0
+         # On resume: load already-completed question IDs from Valkey
+         if context.resume and context.stage_dir:
+             done = shared.database.safe_command("SMEMBERS", "stage:done:questions")
+@@ -301,7 +456,22 @@ class PostGenerator(Generator):
+             logger.info(f"Resume: {len(PostsWalker.done_set)} questions already staged")
+         else:
+             PostsWalker.done_set = set()
+-        super().run()
++
++        if context.incremental:
++            # A3: snapshot-aware full pass — never done_set-based skips, and the
++            # seen set starts empty so an interrupted rerun rescans fully before
++            # any pruning is allowed.
++            PostsWalker.done_set = set()
++            shared.database.safe_command("DEL", f"snapshot:{context.snapshot_id}:seen")
++            # H1: exclusive stage-root lock held from seen-set reset through
++            # the optional prune (the scraper prunes while this lock is held).
++            lock_handle = self.acquire_incremental_lock()
++            try:
++                super().run()
++            finally:
++                self.release_incremental_lock(lock_handle)
++        else:
++            super().run()
+ 
+     def processor(self, item):
+         post = item
+@@ -325,6 +495,11 @@ class PostGenerator(Generator):
+             stage_path = stage_root / "html" / hex_prefix / str(post_id)
+             stage_path.mkdir(parents=True, exist_ok=True)
+ 
++            if context.incremental:
++                self._stage_incremental(post, post_id, path, stage_path)
++                return
++
++            # LEGACY staging (resumable full builds): schema_version=1 manifests
+             post_page = shared.renderer.get_question(post)
+ 
+             # Render redirect info for answers
+@@ -337,8 +512,9 @@ class PostGenerator(Generator):
+             html_tmp.write_text(post_page)
+             html_tmp.rename(stage_path / "index.html")
+ 
+-            import json
+             manifest = {
++                "schema_version": 1,
++                "post_id": post_id,
+                 "title": shared.rewriter.rewrite_string(post.get("Title") or ""),
+                 "zim_path": path,
+                 "answer_redirects": answer_redirects,
+@@ -375,6 +551,69 @@ class PostGenerator(Generator):
+                         target_path=path,
+                     )
+ 
++    def _stage_incremental(self, post, post_id, path, stage_path):
++        """Snapshot-aware staging: skip unchanged pages, else render + manifest v2."""
++        fingerprint = fingerprint_post(post)
++        manifest_path = stage_path / "manifest.json"
++        existing_manifest = None
++        if manifest_path.exists():
++            try:
++                existing_manifest = json.loads(manifest_path.read_text())
++            except Exception:
++                existing_manifest = None
++        if should_skip_render(existing_manifest, fingerprint) and (
++            stage_path / "index.html"
++        ).exists():
++            # unchanged: leave bytes and mtime untouched, no manifest rewrite.
++            # Still record the page in this snapshot's seen set so the prune
++            # pass (H2/H3) keeps it.
++            logger.debug(f"Unchanged question {post_id} — skipping re-render")
++            shared.database.safe_command(
++                "SADD", f"snapshot:{context.snapshot_id}:seen", post_id
++            )
++            return
++
++        try:
++            post_page = shared.renderer.get_question(post)
++
++            # Render redirect info for answers
++            answer_redirects = []
++            for answer in post.get("answers", []):
++                answer_redirects.append(str(answer["Id"]))
++
++            # Atomic write: HTML first, then manifest
++            html_tmp = stage_path / ".index.html.tmp"
++            html_tmp.write_text(post_page)
++            html_tmp.rename(stage_path / "index.html")
++
++            manifest = {
++                "schema_version": 2,
++                "post_id": post_id,
++                "source_sha256": fingerprint,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": context.snapshot_id,
++                "zim_path": path,
++                "title": shared.rewriter.rewrite_string(post.get("Title") or ""),
++                "answer_redirects": answer_redirects,
++                "rendered_at": datetime.datetime.now(datetime.UTC).isoformat(),
++                "tool_version": "sotoki-3.0.2-patched",
++            }
++            manifest_tmp = stage_path / ".manifest.json.tmp"
++            manifest_tmp.write_text(json.dumps(manifest))
++            manifest_tmp.rename(stage_path / "manifest.json")
++
++            # Mark seen in this snapshot + done in the stage checkpoint
++            shared.database.safe_command(
++                "SADD", f"snapshot:{context.snapshot_id}:seen", post_id
++            )
++            shared.database.safe_command("SADD", "stage:done:questions", post_id)
++            del post_page
++        except Exception:
++            # H2: track item failures; prune requires zero failures
++            with PostGenerator.failures_lock:
++                PostGenerator.failures += 1
++            raise
++
+     def generate_questions_page(self):
+         paginator = SortedSetPaginator(
+             shared.postsdatabase.questions_key(),
+-- 
+2.55.0
+

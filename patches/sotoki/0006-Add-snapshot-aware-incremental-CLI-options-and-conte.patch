@@ -1,0 +1,100 @@
+From 729e0efc947b380f8a7a19701767e5f533fe1fb1 Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:41:26 -0400
+Subject: [PATCH 1/4] Add snapshot-aware incremental CLI options and context
+ fields
+
+---
+ src/sotoki/context.py    |  6 ++++++
+ src/sotoki/entrypoint.py | 44 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/src/sotoki/context.py b/src/sotoki/context.py
+index 87a71db..b7c2702 100644
+--- a/src/sotoki/context.py
++++ b/src/sotoki/context.py
+@@ -57,6 +57,12 @@ class Context:
+     assemble_only: bool = False
+     resume: bool = False
+ 
++    # snapshot-aware incremental update
++    incremental: bool = False
++    snapshot_id: str = ""
++    prune_missing: bool = False
++    archive_dir: str = ""
++
+     # censorship
+     censor_words_list: str = ""
+     without_images: bool = False
+diff --git a/src/sotoki/entrypoint.py b/src/sotoki/entrypoint.py
+index 4072a51..3115c87 100644
+--- a/src/sotoki/entrypoint.py
++++ b/src/sotoki/entrypoint.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ 
+ import argparse
++import re
+ from pathlib import Path
+ 
+ from sotoki.constants import NAME, SCRAPER
+@@ -257,6 +258,38 @@ def prepare_context(raw_args: list[str]) -> None:
+         dest="resume",
+     )
+ 
++    advanced.add_argument(
++        "--incremental",
++        help="Snapshot-aware incremental update: fingerprint each staged question and "
++        "re-render only changed pages (requires --snapshot-id and --stage-dir)",
++        action="store_true",
++        dest="incremental",
++    )
++
++    advanced.add_argument(
++        "--snapshot-id",
++        help="Immutable identifier of the dump snapshot being processed, e.g. "
++        "2026-07-01. Required with --incremental; allowed chars [A-Za-z0-9._-]",
++        dest="snapshot_id",
++    )
++
++    advanced.add_argument(
++        "--prune-missing",
++        help="After a fully successful incremental scan, remove staged v2 question "
++        "pages absent from the current snapshot (requires --incremental). "
++        "Plan is journaled and fsync'd before any removal",
++        action="store_true",
++        dest="prune_missing",
++    )
++
++    advanced.add_argument(
++        "--archive-dir",
++        help="Directory holding a local StackExchange dump archive "
++        "(stackoverflow.com.7z). The archive is copied into the per-snapshot "
++        "build dir and its SHA-256 is stamped for provenance",
++        dest="archive_dir",
++    )
++
+     advanced.add_argument(
+         "--dev-skip-tags-meta",
+         help="Dev only. don't run tag metadata. assumes redis and dumps",
+@@ -287,6 +320,17 @@ def prepare_context(raw_args: list[str]) -> None:
+ 
+     args = parser.parse_args(raw_args)
+ 
++    # Snapshot-aware incremental validation
++    if args.incremental and not args.snapshot_id:
++        parser.error("snapshot-id required with --incremental")
++    if args.prune_missing and not args.incremental:
++        parser.error("--prune-missing requires --incremental")
++    if args.snapshot_id and not re.fullmatch(r"[A-Za-z0-9._-]+", args.snapshot_id):
++        parser.error(
++            f"invalid snapshot-id {args.snapshot_id!r}: "
++            "allowed characters are [A-Za-z0-9._-]"
++        )
++
+     # Ignore unset values so they do not override the default specified in Context
+     args_dict = {key: value for key, value in args._get_kwargs() if value}
+ 
+-- 
+2.55.0
+

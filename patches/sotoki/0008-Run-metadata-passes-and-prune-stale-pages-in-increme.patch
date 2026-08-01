@@ -1,0 +1,220 @@
+From 1e8f71645f28e0f3d386f3a6ade27c5b5f1809c4 Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:43:45 -0400
+Subject: [PATCH 3/4] Run metadata passes and prune stale pages in incremental
+ mode
+
+---
+ src/sotoki/scraper.py | 177 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 175 insertions(+), 2 deletions(-)
+
+diff --git a/src/sotoki/scraper.py b/src/sotoki/scraper.py
+index 7e5ffce..88b3e93 100644
+--- a/src/sotoki/scraper.py
++++ b/src/sotoki/scraper.py
+@@ -276,6 +276,26 @@ class StackExchangeToZim:
+             logger.debug(f"Removing {shared.build_dir}")
+             shutil.rmtree(shared.build_dir, ignore_errors=True)
+ 
++    def reset_scraper_database(self):
++        """A2: erase the scraper-owned Redis dataset before an incremental rebuild.
++
++        FLUSHDB (never FLUSHALL): the configured logical DB is dedicated to
++        sotoki. --keep-redis only disables the exit-time flush; incremental
++        metadata is rebuilt from an empty dataset regardless.
++        """
++        parsed = urlparse(context.redis_url)
++        if parsed.scheme == "unix":
++            endpoint = parsed.path  # a socket path cannot carry credentials
++            db = "0"
++        else:
++            endpoint = parsed.hostname or parsed.netloc
++            db = parsed.path.strip("/") or "0"
++        logger.info(
++            f"Incremental metadata reset: FLUSHDB on {endpoint} db {db} "
++            "(dedicated sotoki dataset)"
++        )
++        shared.database.safe_command("FLUSHDB")
++
+     def sanitize_inputs(self):
+         """input & metadata sanitation"""
+ 
+@@ -579,13 +599,39 @@ class StackExchangeToZim:
+                 self.add_illustrations()
+                 self.add_assets()
+ 
++            if context.incremental:
++                # A2: rebuild metadata from an EMPTY scraper dataset, even with
++                # --keep-redis (which only disables the exit-time flush). The
++                # dump preparation already ran before start() (A1), so this
++                # happens AFTER archive prep.
++                self.reset_scraper_database()
++
+             # PATCHED: Steps 2-4 already completed (data in Redis), skip to Step 5
+-            # self.process_tags_metadata()
+-            # self.process_questions_metadata()
++            # — unless incremental, which re-records metadata from the dump.
++            if not is_staging or context.incremental:
++                self.process_tags_metadata()
++                self.process_questions_metadata()
+             self.process_indiv_users_pages()
+ 
+             self.process_questions()
+ 
++            # H2: prune stale staged pages only after a fully successful scan:
++            # input exhausted, all workers joined, zero item failures, and the
++            # snapshot seen-set writes committed (any failure would have raised
++            # out of process_questions before reaching this point).
++            if context.incremental and context.prune_missing:
++                if PostGenerator.failures:
++                    logger.error(
++                        f"Not pruning: {PostGenerator.failures} item failures "
++                        "during incremental staging"
++                    )
++                else:
++                    logger.info(
++                        "Incremental scan completed with zero failures — "
++                        "pruning stale staged pages"
++                    )
++                    self.prune_stale_staged_pages()
++
+             # In staging mode: skip list pages and about page (generated during assembly)
+             if is_staging:
+                 logger.info("Staging complete. Run with --assemble-only to build ZIM.")
+@@ -749,6 +795,133 @@ class StackExchangeToZim:
+ 
+         shared.progresser.print()
+ 
++    def prune_stale_staged_pages(self):
++        """H2/H3/H4: remove staged v2 question pages absent from the current snapshot.
++
++        Prune is opt-in (--prune-missing) and only runs after a fully
++        successful incremental scan (zero item failures, all workers joined).
++        v1 manifests are never touched. The plan is journaled and fsync'd
++        before any removal; on the first failure the remaining candidates are
++        left untouched (quarantine).
++        """
++        if not context.incremental or not context.prune_missing:
++            return
++        stage_root = Path(context.stage_dir)
++        html_root = stage_root / "html"
++        if not html_root.is_dir():
++            logger.info("No staged html root; nothing to prune")
++            return
++
++        seen_key = f"snapshot:{context.snapshot_id}:seen"
++        try:
++            raw_seen = shared.database.safe_command("SMEMBERS", seen_key) or []
++        except Exception as exc:
++            logger.error(f"Cannot read {seen_key}: {exc}; aborting prune")
++            return
++        seen = {int(value) for value in raw_seen if str(value).isdigit()}
++
++        candidates = []
++        for manifest_path in sorted(html_root.glob("*/*/manifest.json")):
++            page_dir = manifest_path.parent
++            try:
++                manifest = json.loads(manifest_path.read_text())
++                if manifest.get("schema_version") != 2:
++                    continue  # v1 pages are out of scope, never touched
++                post_id = manifest.get("post_id")
++                if post_id is None:
++                    continue
++                post_id = str(post_id)
++                if int(post_id) in seen:
++                    continue
++                candidates.append((post_id, page_dir))
++            except Exception as exc:
++                logger.warning(f"Skipping unreadable manifest {manifest_path}: {exc}")
++                continue
++
++        logger.info(
++            f"Prune candidates absent from snapshot {context.snapshot_id}: "
++            f"{len(candidates)}"
++        )
++        if not candidates:
++            return
++
++        # H4: durably journal the plan BEFORE any removal
++        plan_path = stage_root / f"prune-plan-{context.snapshot_id}.jsonl"
++        with open(plan_path, "w", encoding="utf-8") as plan_fh:
++            for post_id, page_dir in candidates:
++                plan_fh.write(
++                    json.dumps({"post_id": post_id, "path": str(page_dir)}) + "\n"
++                )
++            plan_fh.flush()
++            os.fsync(plan_fh.fileno())
++
++        results_path = stage_root / f"prune-results-{context.snapshot_id}.jsonl"
++        removed = 0
++        failed = 0
++        with open(results_path, "w", encoding="utf-8") as results_fh:
++            for post_id, page_dir in candidates:
++                try:
++                    self._validate_prune_target(html_root, post_id, page_dir)
++                    shutil.rmtree(page_dir)
++                except Exception as exc:
++                    failed += 1
++                    results_fh.write(
++                        json.dumps(
++                            {"post_id": post_id, "status": "failed",
++                             "error": str(exc)}
++                        )
++                        + "\n"
++                    )
++                    results_fh.flush()
++                    logger.error(
++                        f"Prune failed on {post_id} ({page_dir}): {exc}; "
++                        "remaining candidates quarantined"
++                    )
++                    break
++                removed += 1
++                results_fh.write(
++                    json.dumps({"post_id": post_id, "status": "removed"}) + "\n"
++                )
++                results_fh.flush()
++
++        logger.info(
++            f"Prune finished: {removed} removed, {failed} failed "
++            f"(plan: {plan_path}, results: {results_path})"
++        )
++
++    @staticmethod
++    def _validate_prune_target(html_root: Path, post_id: str, page_dir: Path) -> None:
++        """H3: a prune target must match the canonical shard layout exactly.
++
++        Raises ValueError when the manifest post_id does not match the directory
++        name, when the resolved path escapes the html root, when the shard does
++        not match, or when a symlink appears anywhere in the path.
++        """
++        try:
++            numeric_id = int(post_id)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"non-numeric post_id {post_id!r}") from exc
++        expected_shard = f"{numeric_id:08x}"[:2]
++        expected = html_root / expected_shard / str(numeric_id)
++        if page_dir.name != str(numeric_id):
++            raise ValueError(
++                f"manifest post_id {post_id} != directory name {page_dir.name}"
++            )
++        resolved_html = Path(os.path.realpath(html_root))
++        resolved = Path(os.path.realpath(page_dir))
++        if not resolved.is_relative_to(resolved_html):
++            raise ValueError(f"prune target {page_dir} resolves outside html root")
++        if resolved != Path(os.path.realpath(expected)):
++            raise ValueError(
++                f"prune target {page_dir} does not match canonical layout {expected}"
++            )
++        # reject symlinks anywhere along the path
++        current = html_root
++        for component in page_dir.relative_to(html_root).parts:
++            current = current / component
++            if current.is_symlink():
++                raise ValueError(f"symlink in prune path: {current}")
++
+     def assemble_zim(self):
+         """Assemble ZIM from staged content in context.stage_dir.
+ 
+-- 
+2.55.0
+

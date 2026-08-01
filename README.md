@@ -89,7 +89,7 @@ python scripts/capture_sotoki_patches.py --package-path . --dry-run
 ```
 bin/                 bash library (common.sh: env + helpers)
 data/                reference baselines & specs (small, tracked)
-docs/                provenance, architecture, configuration, maintenance
+docs/                provenance, system design, configuration, maintenance
 patches/sotoki/      patch series (capture pending)
 scripts/             python/bash tooling (scaffolding today)
 requirements/        python dependency pins

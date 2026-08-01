@@ -9,12 +9,17 @@ upstream:
 patch_series:
   status: captured   # capture-pending | captured | applied
   directory: patches/sotoki/
-  commit_count: 5
+  commit_count: 9
+  implemented_features:
+    - snapshot-aware incremental mode
   note: >
-    5-patch series captured from the working site-packages install,
-    parameterized to remove machine-specific paths (see
-    patches/sotoki/README.md). Each patch must apply cleanly on
-    base_commit; a patch failure on a newer upstream must be explicit.
+    9-patch series: 5 patches captured from the working site-packages
+    install, parameterized to remove machine-specific paths (see
+    patches/sotoki/README.md), plus 4 new commits (0006-0009) implementing
+    the snapshot-aware incremental update mode (fingerprint + render
+    contract, per-snapshot build dirs, seen sets, opt-in hardened prune,
+    local archive support, Redis ownership). Each patch must apply cleanly
+    on base_commit; a patch failure on a newer upstream must be explicit.
 
 requirements:
   python: ">=3.12"

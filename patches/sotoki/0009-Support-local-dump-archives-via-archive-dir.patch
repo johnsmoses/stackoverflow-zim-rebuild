@@ -1,0 +1,886 @@
+From 70aa8742fe15cd05c3c0cae62a6c6b9b3af222b1 Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:45:06 -0400
+Subject: [PATCH 4/4] Support local dump archives via --archive-dir
+
+---
+ src/sotoki/archives.py                |  55 +-
+ src/sotoki/scraper.py                 |   9 +-
+ tests/incremental/test_incremental.py | 753 ++++++++++++++++++++++++++
+ 3 files changed, 814 insertions(+), 3 deletions(-)
+ create mode 100644 tests/incremental/test_incremental.py
+
+diff --git a/src/sotoki/archives.py b/src/sotoki/archives.py
+index 828555e..1dab4eb 100644
+--- a/src/sotoki/archives.py
++++ b/src/sotoki/archives.py
+@@ -1,6 +1,9 @@
+ #!/usr/bin/env python
+ 
+ import concurrent.futures as cf
++import hashlib
++import shutil
++from pathlib import Path
+ 
+ from zimscraperlib.download import save_large_file, stream_file
+ 
+@@ -27,6 +30,9 @@ class ArchiveManager:
+     As this is a lenghty process (several hours for SO) and the output doesn't
+     change until next dump (twice a year), this handles reusing existing files"""
+ 
++    def __init__(self):
++        self._local_archive_copy: Path | None = None
++
+     @property
+     def dump_parts(self):
+         """XML Dump files we're interested in"""
+@@ -39,9 +45,36 @@ class ArchiveManager:
+         Scraper is capable to download multiple archives per domain. This was used for
+         stackoverflow.com which was split with one 7z per dump part. This is not the
+         case anymore but scraper capability has not been removed for now.
++
++        With --archive-dir, the selected local dump archive is copied into the
++        build_dir (overwrite) and used instead of downloading (A1). The copy is
++        made once per ArchiveManager instance.
+         """
++        if context.archive_dir:
++            local_archive = Path(context.archive_dir) / f"{shared.dump_domain}.7z"
++            if local_archive.exists():
++                if self._local_archive_copy is None:
++                    self._local_archive_copy = self._copy_local_archive_into_build_dir(
++                        local_archive
++                    )
++                return [self._local_archive_copy]
+         return [shared.build_dir / f"{shared.dump_domain}.7z"]
+ 
++    def _copy_local_archive_into_build_dir(self, source: Path) -> Path:
++        """Copy the selected local dump archive into build_dir (overwrite)."""
++        dest = shared.build_dir / source.name
++        logger.info(f"Using local dump archive {source}; copying to {dest}")
++        shutil.copy2(source, dest)
++        return dest
++
++    def _sha256_of(self, fpath: Path) -> str:
++        """SHA-256 of a file, streamed in 1 MiB chunks."""
++        digest = hashlib.sha256()
++        with open(fpath, "rb") as fh:
++            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
++                digest.update(chunk)
++        return digest.hexdigest()
++
+     def download_and_extract_archives(self):
+         logger.info("Downloading archive(s)…")
+ 
+@@ -117,8 +150,26 @@ class ArchiveManager:
+         users = shared.build_dir / "users_with_badges.xml"
+         posts = shared.build_dir / "posts_complete.xml"
+ 
+-        # check what needs to be done for each substep in order to reuse existing files
+-        if not tags.exists() or not users.exists() or not posts.exists():
++        if context.incremental:
++            # A1: incremental snapshots never reuse stale prepared files
++            # (posts_complete.xml/Tags.xml). The selected archive (local copy
++            # when --archive-dir is set, otherwise downloaded) is re-extracted
++            # and its SHA-256 is stamped for provenance. The stamp is written
++            # after extraction because extraction cleanup removes non-XML files.
++            archive = self.archives[0]
++            archive_sha256 = self._sha256_of(archive) if context.archive_dir else None
++            for prepared in (tags, users, posts):
++                if prepared.exists():
++                    prepared.unlink()
++            self.download_and_extract_archives()
++            if archive_sha256:
++                stamp_path = shared.build_dir / "archive.sha256"
++                stamp_path.write_text(f"{archive_sha256}\n", encoding="utf-8")
++                logger.info(
++                    f"Stamped snapshot archive SHA-256: {archive_sha256} -> "
++                    f"{stamp_path}"
++                )
++        elif not tags.exists() or not users.exists() or not posts.exists():
+             if not all(
+                 shared.build_dir.joinpath(f"{part}.xml").exists()
+                 for part in self.dump_parts
+diff --git a/src/sotoki/scraper.py b/src/sotoki/scraper.py
+index 88b3e93..c905e66 100644
+--- a/src/sotoki/scraper.py
++++ b/src/sotoki/scraper.py
+@@ -84,8 +84,15 @@ class StackExchangeToZim:
+         if context.build_dir_is_tmp_dir:
+             shared.build_dir = context.tmp_dir
+         else:
++            # A1: per-snapshot build_dir — the snapshot_id is part of the name so
++            # incremental runs never reuse another snapshot's prepared files.
++            prefix = (
++                f"{shared.online_domain}_{context.snapshot_id}_"
++                if context.incremental
++                else f"{shared.online_domain}_"
++            )
+             shared.build_dir = pathlib.Path(
+-                tempfile.mkdtemp(prefix=f"{shared.online_domain}_", dir=context.tmp_dir)
++                tempfile.mkdtemp(prefix=prefix, dir=context.tmp_dir)
+             )
+         if context.stats_filename:
+             context.stats_filename.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/incremental/test_incremental.py b/tests/incremental/test_incremental.py
+new file mode 100644
+index 0000000..ef057fc
+--- /dev/null
++++ b/tests/incremental/test_incremental.py
+@@ -0,0 +1,753 @@
++#!/usr/bin/env python
++"""Snapshot-aware incremental mode tests (Task 4).
++
++Pure pytest: no redis, no libzim, no network. ``shared.database`` is replaced
++by a dict-backed fake via ``unittest.mock.patch``. Context is initialized by
++``tests/conftest.py``.
++"""
++
++import copy
++import json
++import os
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from sotoki.entrypoint import prepare_context
++from sotoki.posts import (
++    RENDER_CONTRACT_VERSION,
++    PostGenerator,
++    PostsWalker,
++    fingerprint_post,
++    harmonize_post,
++    should_skip_render,
++)
++from sotoki.scraper import StackExchangeToZim
++from sotoki.utils.shared import context, shared
++
++
++class FakeDatabase:
++    """Dict-backed stand-in for RedisDatabase used by incremental tests."""
++
++    def __init__(self):
++        self.data = {}
++        self.commands = []
++
++    def safe_command(self, command, *args, **kwargs):
++        self.commands.append((command.upper(), list(args)))
++        cmd = command.upper()
++        if cmd == "SADD":
++            self.data.setdefault(args[0], set()).add(args[1])
++            return 1
++        if cmd == "SMEMBERS":
++            return sorted(self.data.get(args[0], set()))
++        if cmd == "SREM":
++            self.data.get(args[0], set()).discard(args[1])
++            return 1
++        if cmd == "SISMEMBER":
++            return args[1] in self.data.get(args[0], set())
++        if cmd == "DEL":
++            return int(self.data.pop(args[0], None) is not None)
++        if cmd == "FLUSHDB":
++            self.data.clear()
++            return True
++        if cmd == "ZCARD":
++            return len(self.data.get(args[0], set()))
++        if cmd == "ZADD":
++            self.data.setdefault(args[0], set()).add(args[1])
++            return 1
++        raise NotImplementedError(f"FakeDatabase: {cmd} {args}")
++
++    def get_set_count(self, set_name):
++        return len(self.data.get(set_name, set()))
++
++    def zadd(self, name, mapping):
++        return self.safe_command("ZADD", name, mapping)
++
++    def teardown(self):
++        pass
++
++    def remove(self):
++        if not context.keep_redis:
++            self.data.clear()
++
++    def purge(self):
++        pass
++
++
++@pytest.fixture(autouse=True)
++def _reset_shared_state():
++    """Reset class-level counters between tests."""
++    PostGenerator.failures = 0
++    PostsWalker.done_set = set()
++    yield
++    PostGenerator.failures = 0
++    PostsWalker.done_set = set()
++
++
++@pytest.fixture
++def post():
++    """A realistic PostsWalker-style question dict (pre-harmonize)."""
++    return {
++        "Id": 42,
++        "Title": "How do I do X?",
++        "Body": "<p>body text</p>",
++        "Score": 5,
++        "Tags": "<tag1><tag2>",
++        "OwnerUserId": "99",
++        "OwnerDisplayName": "alice",
++        "CreationDate": "2020-01-01T00:00:00Z",
++        "LastActivityDate": "2021-01-01T00:00:00Z",
++        "ViewCount": 100,
++        "LastEditDate": "2020-06-01T00:00:00Z",
++        "LastEditorUserId": "7",
++        "AcceptedAnswerId": "10",
++        "comments": [
++            {
++                "Id": "1",
++                "PostId": "42",
++                "UserId": "5",
++                "Score": "2",
++                "Text": "nice comment",
++                "CreationDate": "2020-01-01T00:00:00Z",
++                "ContentLicense": "CC BY-SA 4.0",
++            }
++        ],
++        "answers": [
++            {
++                "Id": "10",
++                "Score": "3",
++                "Body": "<p>answer body</p>",
++                "OwnerUserId": "8",
++                "OwnerDisplayName": "bob",
++                "CreationDate": "2020-01-02T00:00:00Z",
++                "LastEditDate": "2020-01-03T00:00:00Z",
++                "LastEditorUserId": "8",
++                "comments": [],
++            }
++        ],
++        "links": {"linked": [{"Id": 5, "Name": "other question"}], "duplicate": []},
++    }
++
++
++@pytest.fixture
++def incr_env(tmp_path):
++    """Context + fakes for incremental processor/prune tests."""
++    stage = tmp_path / "stage"
++    stage.mkdir()
++    context.stage_dir = str(stage)
++    context.incremental = True
++    context.snapshot_id = "snap-1"
++    context.prune_missing = True
++    context.resume = False
++    context.archive_dir = ""
++    fake_db = FakeDatabase()
++    renderer = MagicMock()
++    renderer.get_question.return_value = "<html>rendered</html>"
++    rewriter = MagicMock()
++    rewriter.rewrite_string.return_value = "Title"
++    old_db = getattr(shared, "database", None)
++    old_renderer = getattr(shared, "renderer", None)
++    old_rewriter = getattr(shared, "rewriter", None)
++    shared.database = fake_db
++    shared.renderer = renderer
++    shared.rewriter = rewriter
++    try:
++        yield stage, fake_db
++    finally:
++        shared.database = old_db
++        shared.renderer = old_renderer
++        shared.rewriter = old_rewriter
++        context.incremental = False
++        context.prune_missing = False
++        context.snapshot_id = ""
++        context.stage_dir = ""
++        context.archive_dir = ""
++
++
++def _scraper_harness():
++    """StackExchangeToZim instance without __init__ side effects."""
++    return StackExchangeToZim.__new__(StackExchangeToZim)
++
++
++class _SharedMocks:
++    """Temporarily install attributes on the plain Shared instance.
++
++    patch.object cannot be used: most attributes (database, creator, ...) do
++    not exist on the instance until runtime, and Shared is not a mock.
++    """
++
++    def __init__(self, **mocks):
++        self.mocks = mocks
++        self.old = {}
++
++    def __enter__(self):
++        for name, value in self.mocks.items():
++            self.old[name] = getattr(shared, name, None)
++            setattr(shared, name, value)
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        for name, value in self.old.items():
++            if value is None:
++                if hasattr(shared, name):
++                    delattr(shared, name)
++            else:
++                setattr(shared, name, value)
++        return False
++
++
++def _shared_fakes():
++    """Mock set required to run scraper.start() in staging mode."""
++    return _SharedMocks(
++        creator=MagicMock(),
++        progresser=MagicMock(),
++        executor=MagicMock(),
++        img_executor=MagicMock(),
++        imager=MagicMock(),
++    )
++
++
++def _make_v2_page(stage, post_id, sha, snapshot, schema=2, with_html=True):
++    page = stage / "html" / f"{post_id:08x}"[:2] / str(post_id)
++    page.mkdir(parents=True, exist_ok=True)
++    if with_html:
++        (page / "index.html").write_text(f"<p>{post_id}</p>")
++    manifest = {"schema_version": schema, "post_id": post_id}
++    if schema == 2:
++        manifest.update(
++            {
++                "source_sha256": sha,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": snapshot,
++            }
++        )
++    (page / "manifest.json").write_text(json.dumps(manifest))
++    return page
++
++
++# ---------------------------------------------------------------------------
++# 1. fingerprint stability
++# ---------------------------------------------------------------------------
++
++
++def test_fingerprint_stable(post):
++    harmonize_post(post)
++    fingerprint = fingerprint_post(post)
++    # permute dict key order, answer/comment/link order and tags order
++    permuted = {key: post[key] for key in reversed(list(post))}
++    permuted["answers"] = list(reversed(post["answers"]))
++    permuted["comments"] = list(reversed(post["comments"]))
++    permuted["links"] = {
++        "duplicate": [],
++        "linked": [{"Name": "other question", "Id": 5}],
++    }
++    permuted["Tags"] = ["tag2", "tag1"]
++    assert fingerprint_post(permuted) == fingerprint
++    # a fresh equivalent construction is also identical
++    rebuilt = dict(post)
++    rebuilt["answers"] = [dict(post["answers"][0])]
++    rebuilt["comments"] = [dict(post["comments"][0])]
++    rebuilt["links"] = {"linked": [dict(link) for link in post["links"]["linked"]], "duplicate": []}
++    assert fingerprint_post(rebuilt) == fingerprint
++
++
++# ---------------------------------------------------------------------------
++# 2. fingerprint changes on any contracted edit
++# ---------------------------------------------------------------------------
++
++
++def test_fingerprint_changes_on_edit(post):
++    base = copy.deepcopy(post)
++    harmonize_post(base)
++    base_fingerprint = fingerprint_post(base)
++
++    field_edits = {
++        "title": ("Title", "Different title?"),
++        "body": ("Body", "<p>changed body</p>"),
++        "score": ("Score", 999),
++        "view_count": ("ViewCount", 12345),
++        "last_edit_date": ("LastEditDate", "2021-05-05T00:00:00Z"),
++        "last_editor": ("LastEditorUserId", "111"),
++        "accepted_answer": ("AcceptedAnswerId", "9999"),
++    }
++    for name, (field, value) in field_edits.items():
++        edited = copy.deepcopy(base)
++        edited[field] = value
++        assert fingerprint_post(edited) != base_fingerprint, name
++
++    # accepted answer removed
++    edited = copy.deepcopy(base)
++    edited.pop("AcceptedAnswerId", None)
++    assert fingerprint_post(edited) != base_fingerprint
++
++    # comment Text
++    edited = copy.deepcopy(base)
++    edited["comments"][0]["Text"] = "different comment"
++    assert fingerprint_post(edited) != base_fingerprint
++
++    # answer Body
++    edited = copy.deepcopy(base)
++    edited["answers"][0]["Body"] = "<p>changed answer</p>"
++    assert fingerprint_post(edited) != base_fingerprint
++
++    # link added
++    edited = copy.deepcopy(base)
++    edited["links"]["linked"].append({"Id": 77, "Name": "new link"})
++    assert fingerprint_post(edited) != base_fingerprint
++
++    # link removed
++    edited = copy.deepcopy(base)
++    edited["links"]["linked"] = []
++    assert fingerprint_post(edited) != base_fingerprint
++
++    # a field the renderer does not consume does not change the fingerprint
++    edited = copy.deepcopy(base)
++    edited["FavoriteCount"] = "13"
++    assert fingerprint_post(edited) == base_fingerprint
++
++
++# ---------------------------------------------------------------------------
++# 3. skip decision
++# ---------------------------------------------------------------------------
++
++
++def test_skip_decision(post):
++    harmonize_post(post)
++    fingerprint = fingerprint_post(post)
++    matching = {
++        "schema_version": 2,
++        "post_id": 42,
++        "source_sha256": fingerprint,
++        "render_contract_version": RENDER_CONTRACT_VERSION,
++    }
++    assert should_skip_render(matching, fingerprint) is True
++    # different source digest
++    assert should_skip_render(dict(matching, source_sha256="x" * 64), fingerprint) is False
++    # different render contract version
++    assert (
++        should_skip_render(dict(matching, render_contract_version="2"), fingerprint)
++        is False
++    )
++    # schema_version 1 (legacy full-build manifest)
++    assert should_skip_render(dict(matching, schema_version=1), fingerprint) is False
++    # missing manifest
++    assert should_skip_render(None, fingerprint) is False
++    assert should_skip_render({}, fingerprint) is False
++
++
++# ---------------------------------------------------------------------------
++# 4. unchanged page preserved
++# ---------------------------------------------------------------------------
++
++
++def test_unchanged_page_preserved(incr_env, post):
++    stage, fake_db = incr_env
++    fingerprint = fingerprint_post(post)  # harmonize-agnostic
++    page = stage / "html" / "00" / "42"
++    page.mkdir(parents=True)
++    (page / "index.html").write_bytes(b"<html>original bytes</html>")
++    os.utime(page / "index.html", (1234567890, 1234567890))
++    (page / "manifest.json").write_text(
++        json.dumps(
++            {
++                "schema_version": 2,
++                "post_id": 42,
++                "source_sha256": fingerprint,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": "snap-old",
++            }
++        )
++    )
++    html_before = (page / "index.html").read_bytes()
++    manifest_before = (page / "manifest.json").read_bytes()
++    shared.renderer.get_question.side_effect = AssertionError("must not re-render")
++
++    PostGenerator().processor(copy.deepcopy(post))
++
++    assert (page / "index.html").read_bytes() == html_before
++    assert (page / "manifest.json").read_bytes() == manifest_before
++    assert (page / "index.html").stat().st_mtime_ns == 1234567890_000000000
++    # the page is still recorded in the snapshot seen set so prune keeps it
++    assert fake_db.data[f"snapshot:snap-1:seen"] == {42}
++
++
++# ---------------------------------------------------------------------------
++# 5. re-render on change
++# ---------------------------------------------------------------------------
++
++
++def test_rerender_on_change(incr_env, post):
++    stage, fake_db = incr_env
++    page = stage / "html" / "00" / "42"
++    page.mkdir(parents=True)
++    (page / "index.html").write_text("<html>old</html>")
++    (page / "manifest.json").write_text(
++        json.dumps(
++            {
++                "schema_version": 2,
++                "post_id": 42,
++                "source_sha256": "f" * 64,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": "snap-old",
++            }
++        )
++    )
++    changed = copy.deepcopy(post)
++    changed["Score"] = 77
++    shared.renderer.get_question.return_value = "<html>new version</html>"
++
++    PostGenerator().processor(changed)
++
++    assert (page / "index.html").read_text() == "<html>new version</html>"
++    manifest = json.loads((page / "manifest.json").read_text())
++    assert manifest["schema_version"] == 2
++    assert manifest["source_sha256"] == fingerprint_post(changed)
++    assert manifest["render_contract_version"] == RENDER_CONTRACT_VERSION
++    assert manifest["snapshot_id"] == "snap-1"
++    assert fake_db.data[f"snapshot:snap-1:seen"] == {42}
++    assert fake_db.data["stage:done:questions"] == {42}
++
++
++# ---------------------------------------------------------------------------
++# 6. new post added
++# ---------------------------------------------------------------------------
++
++
++def test_new_post_added(incr_env, post):
++    stage, fake_db = incr_env
++    shared.renderer.get_question.return_value = "<html>brand new</html>"
++
++    PostGenerator().processor(copy.deepcopy(post))
++
++    page = stage / "html" / "00" / "42"
++    assert (page / "index.html").read_text() == "<html>brand new</html>"
++    manifest = json.loads((page / "manifest.json").read_text())
++    assert manifest["schema_version"] == 2
++    assert manifest["post_id"] == 42
++    assert fake_db.data[f"snapshot:snap-1:seen"] == {42}
++    assert fake_db.data["stage:done:questions"] == {42}
++
++
++# ---------------------------------------------------------------------------
++# 7. metadata reset (A2 FLUSHDB before metadata passes)
++# ---------------------------------------------------------------------------
++
++
++def test_metadata_reset(incr_env):
++    stage, fake_db = incr_env
++    scraper = _scraper_harness()
++    calls = []
++    with (
++        patch.object(
++            scraper, "process_tags_metadata", side_effect=lambda: calls.append("tags")
++        ),
++        patch.object(
++            scraper,
++            "process_questions_metadata",
++            side_effect=lambda: calls.append("questions"),
++        ),
++        patch.object(
++            scraper, "process_indiv_users_pages", side_effect=lambda: calls.append("users")
++        ),
++        patch.object(
++            scraper,
++            "process_questions",
++            side_effect=lambda: calls.append("questions_pages"),
++        ),
++        patch.object(scraper, "prune_stale_staged_pages"),
++        _shared_fakes(),
++    ):
++        assert scraper.start() is None
++
++    # FLUSHDB is the very first database command (before any metadata pass)
++    assert fake_db.commands and fake_db.commands[0][0] == "FLUSHDB"
++    # metadata passes run in incremental mode and re-record from the dump
++    assert calls == ["tags", "questions", "users", "questions_pages"]
++
++
++# ---------------------------------------------------------------------------
++# 8. prune cross-snapshot
++# ---------------------------------------------------------------------------
++
++
++def test_prune_cross_snapshot(incr_env):
++    stage, fake_db = incr_env
++    _make_v2_page(stage, post_id=1, sha="a" * 64, snapshot="snap-old")
++    _make_v2_page(stage, post_id=2, sha="b" * 64, snapshot="snap-old")
++    fake_db.data[f"snapshot:snap-1:seen"] = {1}
++    scraper = _scraper_harness()
++
++    # without the flag nothing is removed
++    context.prune_missing = False
++    scraper.prune_stale_staged_pages()
++    assert (stage / "html" / "00" / "2").exists()
++
++    # with the flag, page 2 (absent from current snapshot) is pruned, page 1 kept
++    context.prune_missing = True
++    scraper.prune_stale_staged_pages()
++    assert (stage / "html" / "00" / "1").exists()
++    assert not (stage / "html" / "00" / "2").exists()
++
++    # H4: plan journaled before removal, results recorded per item
++    plan = [
++        json.loads(line)
++        for line in (stage / "prune-plan-snap-1.jsonl").read_text().strip().splitlines()
++        if line
++    ]
++    assert len(plan) == 1 and plan[0]["post_id"] == "2"
++    results = [
++        json.loads(line)
++        for line in (stage / "prune-results-snap-1.jsonl")
++        .read_text()
++        .strip()
++        .splitlines()
++        if line
++    ]
++    assert len(results) == 1 and results[0]["status"] == "removed"
++
++
++# ---------------------------------------------------------------------------
++# 9. interruption -> no prune
++# ---------------------------------------------------------------------------
++
++
++def test_interrupted_no_prune(incr_env):
++    stage, fake_db = incr_env
++    scraper = _scraper_harness()
++    with (
++        patch.object(scraper, "process_tags_metadata"),
++        patch.object(scraper, "process_questions_metadata"),
++        patch.object(scraper, "process_indiv_users_pages"),
++        patch.object(
++            scraper, "process_questions", side_effect=RuntimeError("staging aborted")
++        ),
++        patch.object(scraper, "prune_stale_staged_pages") as m_prune,
++        _shared_fakes(),
++    ):
++        result = scraper.start()
++
++    assert result == 1
++    m_prune.assert_not_called()
++
++
++# ---------------------------------------------------------------------------
++# 10. v1 pages retained
++# ---------------------------------------------------------------------------
++
++
++def test_v1_page_retained(incr_env):
++    stage, fake_db = incr_env
++    _make_v2_page(stage, post_id=1, sha="a" * 64, snapshot="snap-old")
++    _make_v2_page(stage, post_id=2, sha="b" * 64, snapshot="snap-old")
++    # legacy full-build page: schema_version 1, absent from the seen set
++    _make_v2_page(stage, post_id=3, sha="", snapshot="", schema=1)
++    fake_db.data[f"snapshot:snap-1:seen"] = {1}
++    scraper = _scraper_harness()
++
++    scraper.prune_stale_staged_pages()
++
++    assert (stage / "html" / "00" / "1").exists()
++    assert not (stage / "html" / "00" / "2").exists(), "v2 absent page pruned"
++    assert (stage / "html" / "00" / "3").exists(), "v1 page must be retained"
++
++
++# ---------------------------------------------------------------------------
++# 11. snapshot seen-set isolation
++# ---------------------------------------------------------------------------
++
++
++def test_snapshot_seen_isolation(incr_env, post):
++    stage, fake_db = incr_env
++    shared.renderer.get_question.return_value = "<html>1</html>"
++    PostGenerator().processor(copy.deepcopy(post))
++
++    second = copy.deepcopy(post)
++    second["Id"] = 43
++    context.snapshot_id = "snap-2"
++    PostGenerator().processor(second)
++
++    assert fake_db.data[f"snapshot:snap-1:seen"] == {42}
++    assert fake_db.data[f"snapshot:snap-2:seen"] == {43}
++    assert fake_db.data["stage:done:questions"] == {42, 43}
++    assert "snapshot:snap-1:seen" in fake_db.data
++    assert "snapshot:snap-2:seen" in fake_db.data
++
++
++# ---------------------------------------------------------------------------
++# 12. entrypoint validation
++# ---------------------------------------------------------------------------
++
++
++def _entry_args(*extra):
++    return [
++        "-d",
++        "test.stackexchange.com",
++        "--mirror",
++        "http://example.invalid",
++        "--title",
++        "T",
++        "--description",
++        "D",
++        *extra,
++    ]
++
++
++def test_prune_missing_requires_incremental(capsys):
++    with pytest.raises(SystemExit) as exc:
++        prepare_context(_entry_args("--prune-missing"))
++    assert exc.value.code == 2
++    assert "--prune-missing requires --incremental" in capsys.readouterr().err
++
++
++def test_incremental_requires_snapshot_id(capsys):
++    with pytest.raises(SystemExit) as exc:
++        prepare_context(_entry_args("--incremental"))
++    assert exc.value.code == 2
++    assert "snapshot-id required with --incremental" in capsys.readouterr().err
++
++
++def test_invalid_snapshot_id_rejected(capsys):
++    with pytest.raises(SystemExit) as exc:
++        prepare_context(_entry_args("--incremental", "--snapshot-id", "bad/id!"))
++    assert exc.value.code == 2
++    assert "invalid snapshot-id" in capsys.readouterr().err
++
++
++# ---------------------------------------------------------------------------
++# 13. swallowed worker errors -> no prune
++# ---------------------------------------------------------------------------
++
++
++def test_swallowed_worker_error_no_prune(incr_env):
++    stage, fake_db = incr_env
++    scraper = _scraper_harness()
++
++    def _swallow(*args, **kwargs):
++        # simulate worker errors that did not abort the pass
++        PostGenerator.failures = 3
++
++    with (
++        patch.object(scraper, "process_tags_metadata"),
++        patch.object(scraper, "process_questions_metadata"),
++        patch.object(scraper, "process_indiv_users_pages"),
++        patch.object(scraper, "process_questions", side_effect=_swallow),
++        patch.object(scraper, "prune_stale_staged_pages") as m_prune,
++        _shared_fakes(),
++    ):
++        scraper.start()
++
++    m_prune.assert_not_called()
++
++
++# ---------------------------------------------------------------------------
++# 14. concurrent run rejected (H1 lock)
++# ---------------------------------------------------------------------------
++
++
++def test_concurrent_run_rejected(incr_env):
++    stage, fake_db = incr_env
++    generator = PostGenerator()
++    first = generator.acquire_incremental_lock()
++    try:
++        with pytest.raises(RuntimeError, match="concurrent runs are rejected"):
++            generator.acquire_incremental_lock()
++    finally:
++        generator.release_incremental_lock(first)
++    # after release the lock can be acquired again
++    second = generator.acquire_incremental_lock()
++    generator.release_incremental_lock(second)
++
++
++# ---------------------------------------------------------------------------
++# 15. corrupt manifest skipped
++# ---------------------------------------------------------------------------
++
++
++def test_corrupt_manifest_skipped(incr_env):
++    stage, fake_db = incr_env
++    _make_v2_page(stage, post_id=1, sha="a" * 64, snapshot="snap-old")
++    # unparseable manifest
++    page = stage / "html" / "00" / "2"
++    page.mkdir(parents=True)
++    (page / "index.html").write_text("<p>2</p>")
++    (page / "manifest.json").write_text("{not json!!!")
++    # v2 manifest without post_id
++    page3 = stage / "html" / "00" / "3"
++    page3.mkdir(parents=True)
++    (page3 / "index.html").write_text("<p>3</p>")
++    (page3 / "manifest.json").write_text(json.dumps({"schema_version": 2}))
++    fake_db.data[f"snapshot:snap-1:seen"] = {1}
++    scraper = _scraper_harness()
++
++    # must not crash, and must not remove the unreadable pages
++    scraper.prune_stale_staged_pages()
++    assert (stage / "html" / "00" / "2").exists()
++    assert (stage / "html" / "00" / "3").exists()
++
++
++# ---------------------------------------------------------------------------
++# 16. path / symlink attacks rejected (H3)
++# ---------------------------------------------------------------------------
++
++
++def test_path_attack_rejected(incr_env):
++    stage, fake_db = incr_env
++    # candidate whose directory name does not match the manifest post_id
++    mismatched = stage / "html" / "00" / "8"
++    mismatched.mkdir(parents=True)
++    (mismatched / "index.html").write_text("<p>8</p>")
++    (mismatched / "manifest.json").write_text(
++        json.dumps(
++            {
++                "schema_version": 2,
++                "post_id": 99,
++                "source_sha256": "c" * 64,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": "snap-old",
++            }
++        )
++    )
++    # symlinked page pointing outside the html root
++    outside = stage.parent / "evil"
++    outside.mkdir()
++    (outside / "index.html").write_text("<p>7777</p>")
++    (outside / "manifest.json").write_text(
++        json.dumps(
++            {
++                "schema_version": 2,
++                "post_id": 7777,
++                "source_sha256": "d" * 64,
++                "render_contract_version": RENDER_CONTRACT_VERSION,
++                "snapshot_id": "snap-old",
++            }
++        )
++    )
++    link = stage / "html" / "00" / "7777"
++    os.symlink(outside, link)
++    fake_db.data[f"snapshot:snap-1:seen"] = set()
++    scraper = _scraper_harness()
++
++    # direct validator checks
++    html_root = stage / "html"
++    with pytest.raises(ValueError):
++        StackExchangeToZim._validate_prune_target(html_root, "99", mismatched)
++    with pytest.raises(ValueError):
++        StackExchangeToZim._validate_prune_target(html_root, "7777", link)
++
++    # full prune: the symlink candidate sorts first, fails validation, and the
++    # remaining candidates are quarantined (H4) — nothing may be removed
++    scraper.prune_stale_staged_pages()
++    assert (mismatched / "index.html").exists(), "mismatched dir must be quarantined"
++    assert os.path.islink(link), "symlink must remain"
++    assert (outside / "index.html").exists(), "symlink target must not be removed"
++    results = [
++        json.loads(line)
++        for line in (stage / "prune-results-snap-1.jsonl")
++        .read_text()
++        .strip()
++        .splitlines()
++        if line
++    ]
++    assert len(results) == 1 and results[0]["status"] == "failed"
++    assert "7777" in results[0]["post_id"]
+\ No newline at end of file
+-- 
+2.55.0
+
