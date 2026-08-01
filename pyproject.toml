@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stackoverflow-zim-rebuild"
+version = "0.1.0"
+description = "Rebuild/update toolkit for the StackOverflow ZIM archive from a fresh StackExchange XML dump, on top of a patched sotoki."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "CC0-1.0" }
+authors = [{ name = "stackoverflow-zim-rebuild contributors" }]
+keywords = ["zim", "sotoki", "stackoverflow", "kiwix", "archive"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+  "Operating System :: POSIX",
+  "Topic :: System :: Archiving",
+]
+
+[project.optional-dependencies]
+dev = []
+
+# Metadata-only distribution for now: no importable packages yet.
+# The actual build/update logic lives in scripts/ (Task 4+).
+[tool.setuptools]
+packages = []

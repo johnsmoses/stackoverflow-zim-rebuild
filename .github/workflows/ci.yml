@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (metadata-only)
+        run: pip install -e .
+
+      # The capture script needs a real sotoki package path to report
+      # anything useful; with no package installed this only exercises the
+      # CLI wiring and allowlist bookkeeping. Pass --package-path when a
+      # sotoki checkout is available in CI.
+      - name: Smoke-test patch capture script (dry run)
+        run: python scripts/capture_sotoki_patches.py --package-path . --dry-run
+
+      - name: Shell syntax check
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+          shellcheck bin/*.sh scripts/*.sh

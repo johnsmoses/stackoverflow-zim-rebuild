@@ -1,0 +1,33 @@
+# Environment / secrets — never commit
+.env
+.env.*
+!.env.example
+secrets/
+*private-key*
+
+# WireGuard configs (tunnel used for CDN image recovery)
+.wg*.conf
+
+# Working data — never commit
+data/stage/
+data/redis/
+data/zim/
+data/assets/
+data/baseline-bundle/
+*.zim
+*.rdb
+*.7z
+*.sqlite
+*.log
+
+# Patch work-in-progress
+*.patch.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Node (unused for now, kept for future tooling)
+node_modules/

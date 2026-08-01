@@ -1,0 +1,32 @@
+{
+  "build_date": "2026-07-06",
+  "tool": "sotoki",
+  "tool_commit": "157ca9a",
+  "hash_scheme": "md5(\"https://i.sstatic.net/FILENAME\")",
+  "counts": {
+    "questions": 24152540,
+    "staged_images": 4375716,
+    "zim_entries": 85441337,
+    "redis_db0_keys": 55250097,
+    "initial_placeholders": 521489,
+    "recovered": 410856,
+    "unrecoverable": 120633
+  },
+  "derived": {
+    "recovery_rate": 0.788,
+    "note": "recovered + unrecoverable == initial_placeholders; recovery rate = recovered / initial_placeholders"
+  },
+  "reference_artifacts": {
+    "stackoverflow-final.zim": {
+      "bytes": 152103236002,
+      "human": "142 GB",
+      "note": "full build with images"
+    },
+    "stackoverflow-nopic.zim": {
+      "bytes": 73421904273,
+      "human": "69 GB",
+      "note": "build without images"
+    }
+  },
+  "purpose": "Reference baseline for the July 2026 sotoki run. Future runs compare against these counts with EXPECTED DELTAS, not equality (see docs/verification.md)."
+}

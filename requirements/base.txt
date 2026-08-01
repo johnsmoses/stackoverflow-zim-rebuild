@@ -1,0 +1,9 @@
+# Base Python dependencies for stackoverflow-zim-rebuild.
+#
+# Intentionally empty for now: the patched sotoki and its dependencies are
+# installed into SOTOKI_VENV during bootstrap (Makefile target not yet
+# implemented). As scripts/ grows (Tasks 4+), pin the tools they need here,
+# e.g.:
+#   redis>=5.0
+#   zimtools>=2.0
+#   requests>=2.31

@@ -1,0 +1,22 @@
+# sotoki.lock — pins the upstream sotoki source and the state of the
+# patches/sotoki/ series. This is the contract for reproducibility:
+# the ZIM must be rebuildable from base_commit + the patch series.
+
+upstream:
+  url: https://github.com/openzim/sotoki
+  base_commit: 157ca9a
+
+patch_series:
+  status: capture-pending   # capture-pending | captured | applied
+  directory: patches/sotoki/
+  note: >
+    Patches will be recorded here once captured from the working
+    site-packages install (Task 3). Each patch must apply cleanly on
+    base_commit; a patch failure on a newer upstream must be explicit.
+
+requirements:
+  python: ">=3.12"
+
+notes:
+  - "Do not bump base_commit without re-validating the full patch series."
+  - "See docs/patch-maintenance.md for capture/order/apply policy."
