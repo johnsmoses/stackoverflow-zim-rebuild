@@ -1,0 +1,822 @@
+From 67fe7dc764c4a3f1564d05c60325aefede83a30f Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:13:28 -0400
+Subject: [PATCH 3/5] Add assemble-only ZIM builder, title sanitization, staged
+ HTML fixes
+
+---
+ src/sotoki/renderer.py   |   3 +-
+ src/sotoki/scraper.py    | 500 +++++++++++++++++++++++++++++++++------
+ src/sotoki/utils/html.py |  69 ++----
+ 3 files changed, 451 insertions(+), 121 deletions(-)
+
+diff --git a/src/sotoki/renderer.py b/src/sotoki/renderer.py
+index 41f8106..0b11e74 100644
+--- a/src/sotoki/renderer.py
++++ b/src/sotoki/renderer.py
+@@ -117,7 +117,6 @@ class Renderer:
+             shared.postsdatabase.question_has_accepted_answer
+         )
+         self.env.filters["rewrote"] = shared.rewriter.rewrite
+-        self.env.filters["rewrote_comment"] = shared.rewriter.rewrite_comment
+         self.env.filters["rewrote_string"] = shared.rewriter.rewrite_string
+         self.env.filters["slugify"] = get_slug_for
+         self.global_context = {
+@@ -219,7 +218,7 @@ class Renderer:
+             shared.postsdatabase.questions_key()
+         )
+         stats = shared.postsdatabase.get_questions_stats()
+-        percent_answered = stats["nb_answered"] / total_questions
++        percent_answered = stats["nb_answered"] / max(1, total_questions)
+         return self.env.get_template("about.html").render(
+             body_class="about-page",
+             whereis="about",
+diff --git a/src/sotoki/scraper.py b/src/sotoki/scraper.py
+index 29e3f93..7e5ffce 100644
+--- a/src/sotoki/scraper.py
++++ b/src/sotoki/scraper.py
+@@ -1,11 +1,15 @@
++import json
++import os
+ #!/usr/bin/env python3
+ 
+ import datetime
+ import logging
+ import pathlib
++from pathlib import Path
+ import re
+ import shutil
+ import tempfile
++import unicodedata
+ from urllib.parse import urlparse
+ 
+ import bs4
+@@ -21,6 +25,7 @@ from sotoki.archives import ArchiveManager
+ from sotoki.constants import (
+     HTTP_REQUEST_TIMEOUT,
+     NAME,
++    NB_PAGINATED_QUESTIONS,
+     NB_PAGINATED_QUESTIONS_PER_TAG,
+     NB_QUESTIONS_PAGES,
+     NB_QUESTIONS_PER_PAGE,
+@@ -32,7 +37,7 @@ from sotoki.constants import (
+ from sotoki.css import process_css
+ from sotoki.models import SiteDetails
+ from sotoki.posts import PostFirstPasser, PostGenerator
+-from sotoki.renderer import Renderer
++from sotoki.renderer import Renderer, SortedSetPaginator
+ from sotoki.tags import (
+     TagDescriptionRecorder,
+     TagExcerptRecorder,
+@@ -85,6 +90,81 @@ class StackExchangeToZim:
+         if context.stats_filename:
+             context.stats_filename.parent.mkdir(parents=True, exist_ok=True)
+ 
++    @staticmethod
++    def sanitize_zim_title(title: str, post_id: str | int) -> str:
++        """Return a title safe for libzim's title indexer.
++
++        A tiny number of Stack Overflow titles contain large runs of invisible
++        Unicode format/control characters. libzim may reject those with
++        "Too much loss of data during title indexing". Retrying after such a
++        failure is unsafe because libzim can partially register the path, so we
++        normalize before add_item_for().
++        """
++        cleaned = unicodedata.normalize("NFKC", str(title or ""))
++        cleaned = "".join(
++            " " if ch.isspace() else ch
++            for ch in cleaned
++            if unicodedata.category(ch) not in {"Cc", "Cf", "Cs"}
++        )
++        cleaned = re.sub(r"\s+", " ", cleaned).strip()
++        if len(cleaned) < 3:
++            return f"Question {post_id}"
++        return cleaned[:500]
++
++    @staticmethod
++    def sanitize_staged_html(html_content: str) -> str:
++        """Repair known bad links produced during staged HTML rewriting.
++
++        Some inline links in posts/comments were rewritten as protocol-relative
++        URLs with a bogus authority, e.g. //:None/../../a/123#123. Browsers treat
++        those as external URLs with host ':None', so they are unusable in Kiwix.
++        The intended target is the relative path after that prefix.
++        """
++        html_content = re.sub(r'((?:href|src)=")//:None/', r'\1', html_content)
++
++        if context.without_images:
++            placeholder = (
++                '<span class="s-notice s-notice__info d-block my8" '
++                'role="note">Image omitted in this no-pic archive.</span>'
++            )
++            # Remove common paragraph-wrapped linked images cleanly.
++            html_content = re.sub(
++                r'<p>\s*<a\b[^>]*>\s*<img\b[^>]*\bsrc="[^"]*/images/[0-9a-f]{16,32}"[^>]*>\s*</a>\s*</p>',
++                f'<p>{placeholder}</p>',
++                html_content,
++                flags=re.I | re.S,
++            )
++            # Remove remaining linked images and standalone in-post images.
++            html_content = re.sub(
++                r'<a\b[^>]*>\s*<img\b[^>]*\bsrc="[^"]*/images/[0-9a-f]{16,32}"[^>]*>\s*</a>',
++                placeholder,
++                html_content,
++                flags=re.I | re.S,
++            )
++            html_content = re.sub(
++                r'<img\b[^>]*\bsrc="[^"]*/images/[0-9a-f]{16,32}"[^>]*>',
++                placeholder,
++                html_content,
++                flags=re.I | re.S,
++            )
++            return html_content
++
++        # If an image is stored in-ZIM, make clicking the image open the local
++        # ZIM image instead of the original CDN URL. The rendered <img src> is
++        # already local; only the surrounding <a href> still points to i.sstatic
++        # / imgur / wikimedia in staged HTML.
++        def _localize_image_anchor(match):
++            before_href, after_href, img_tag, img_src = match.groups()
++            return f'<a{before_href}href="{img_src}"{after_href}>{img_tag}'
++
++        html_content = re.sub(
++            r'<a([^>]*?)href="https?://(?:i\.sstatic\.net|i\.stack\.imgur\.com|[^"/]*imgur\.[^"]+|[^"/]*wikimedia\.[^"]+)[^"]*"([^>]*)>(\s*<img\b[^>]*\bsrc="([^"]*/images/[0-9a-f]{16,32})"[^>]*>)',
++            _localize_image_anchor,
++            html_content,
++            flags=re.I,
++        )
++        return html_content
++
+     @web_backoff(base=10, max_tries=10)
+     def _get_site_details(self):
+         resp = requests.get(f"https://{context.domain}", timeout=HTTP_REQUEST_TIMEOUT)
+@@ -215,23 +295,32 @@ class StackExchangeToZim:
+             self.fname = pathlib.Path(f"{context.name}_{period}.zim")
+ 
+     def add_illustrations(self):
++        # Use pre-staged local assets when available (offline assembly)
++        local_assets = Path(context.stage_dir) / "assets" if context.stage_dir else Path("/tmp/sotoki-assets")
++
+         # download and add actual favicon (ICO file)
+         small_favicon_fpath = shared.build_dir / "favicon.ico"
+-        handle_user_provided_file(
+-            source=shared.site_details.small_favicon, dest=small_favicon_fpath
+-        )
+-        shared.creator.add_item_for(
+-            "favicon.ico", fpath=small_favicon_fpath, is_front=False
+-        )
++        local_fav = local_assets / "favicon.ico"
++        if local_fav.exists():
++            shutil.copy(local_fav, small_favicon_fpath)
++            try:
++                shared.creator.add_item_for(
++                    "favicon.ico", fpath=small_favicon_fpath, is_front=False
++                )
++            except Exception as exc:
++                logger.warning(f"Failed to add favicon: {exc}")
+ 
+         # download apple-touch-icon
+         big_favicon_fpath = shared.build_dir / "apple-touch-icon.png"
+-        handle_user_provided_file(
+-            source=shared.site_details.big_favicon, dest=big_favicon_fpath
+-        )
+-        shared.creator.add_item_for(
+-            "apple-touch-icon.png", fpath=big_favicon_fpath, is_front=False
+-        )
++        local_big = local_assets / "apple-touch-icon.png"
++        if local_big.exists():
++            shutil.copy(local_big, big_favicon_fpath)
++            try:
++                shared.creator.add_item_for(
++                    "apple-touch-icon.png", fpath=big_favicon_fpath, is_front=False
++                )
++            except Exception as exc:
++                logger.warning(f"Failed to add apple-touch-icon: {exc}")
+ 
+     def add_assets(self):
+         assets_root = ROOT_DIR.joinpath("assets")
+@@ -240,15 +329,61 @@ class StackExchangeToZim:
+                 if not fpath.is_file() or fpath.name == "README":
+                     continue
+                 logger.debug(str(fpath.relative_to(assets_root)))
+-                shared.creator.add_item_for(
+-                    path=str(fpath.relative_to(assets_root)),
+-                    fpath=fpath,
+-                    is_front=False,
+-                )
++                try:
++                    shared.creator.add_item_for(
++                        path=str(fpath.relative_to(assets_root)),
++                        fpath=fpath,
++                        is_front=False,
++                    )
++                except Exception as exc:
++                    logger.warning(f"Failed to add asset {fpath.relative_to(assets_root)}: {exc} — can_finish not reset (corruption surfaces explicitly)")
++
++        # Use pre-staged local CSS when available (offline assembly)
++        local_assets = Path(context.stage_dir) / "assets" if context.stage_dir else Path("/tmp/sotoki-assets")
++
++        try:
++            if (local_assets / "primary.css").exists():
++                process_css(local_assets / "primary.css", "primary.css")
++            else:
++                process_css(shared.site_details.primary_css, "primary.css")
++
++            if (local_assets / "secondary.css").exists():
++                process_css(local_assets / "secondary.css", "secondary.css")
++            else:
++                process_css(shared.site_details.secondary_css, "secondary.css")
++        except Exception as exc:
++            logger.warning(f"Failed to process CSS: {exc} — can_finish not reset (corruption surfaces explicitly)")
+ 
+-        # download primary|secondary.css from target
+-        process_css(shared.site_details.primary_css, "primary.css")
+-        process_css(shared.site_details.secondary_css, "secondary.css")
++        # Some Stack CSS references remote sprite/static sheets under
++        # cdn.sstatic.net/Img/... . css.py strips cache-busting query fragments
++        # so Kiwix can serve them as normal paths; add harmless placeholders for
++        # the common sprite assets so the final ZIM does not emit cosmetic 404s.
++        try:
++            sprite_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>'
++            png_1x1 = (
++                b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
++                b'\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
++                b'\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01'
++                b'\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
++            )
++            with shared.lock:
++                for path, content, mimetype in [
++                    ("cdn.sstatic.net/Img/unified/sprites.svg", sprite_svg, "image/svg+xml"),
++                    ("cdn.sstatic.net/Img/unified/sprites.png", png_1x1, "image/png"),
++                    ("cdn.sstatic.net/Img/filter-sprites.svg", sprite_svg, "image/svg+xml"),
++                    ("cdn.sstatic.net/Img/filter-sprites.png", png_1x1, "image/png"),
++                ]:
++                    try:
++                        shared.creator.add_item_for(
++                            path=path,
++                            content=content,
++                            mimetype=mimetype,
++                            is_front=False,
++                        )
++                    except Exception as exc:
++                        logger.warning(f"Failed to add placeholder static asset {path}: {exc} — can_finish not reset (corruption surfaces explicitly)")
++        except Exception as exc:
++            logger.warning(f"Failed to add placeholder sprite assets: {exc} — can_finish not reset (corruption surfaces explicitly)")
+ 
+     def run(self):
+ 
+@@ -281,21 +416,29 @@ class StackExchangeToZim:
+         )
+ 
+         # mostly transforms HTML and sends to zim.
+-        # tests show no speed improv. beyond 3 workers.
++        # Configurable via --content-threads (CPU-bound, GIL-limited).
++        content_workers = context.content_threads or max(3, (os.cpu_count() or 4) // 2)
+         shared.executor = SotokiExecutor(
+-            queue_size=10,
+-            nb_workers=3,
++            queue_size=content_workers * 200,
++            nb_workers=content_workers,
++        )
++        logger.info(
++            f"Content workers: {content_workers} (queue: {content_workers * 200})"
+         )
+ 
+         # images handled on a different queue.
+         # mostly network I/O to retrieve and/or upload image.
+         # if not in S3 bucket, resize/optimize webp image
+         # we should consider using coroutines instead of threads
++        img_workers = max(1, context.nb_threads) if context.nb_threads != 1 else 10
+         shared.img_executor = SotokiExecutor(
+-            queue_size=200,
+-            nb_workers=10,
++            queue_size=img_workers * 20,
++            nb_workers=img_workers,
+             prefix="IMG-T-",
+         )
++        logger.info(
++            f"Image workers: {img_workers} (queue: {img_workers * 20})"
++        )
+ 
+         shared.imager = Imager()
+         shared.rewriter = Rewriter()
+@@ -323,6 +466,8 @@ class StackExchangeToZim:
+             f"{s3_msg}"
+         )
+ 
++        shared.progresser = Progresser(shared.total_questions)
++
+         self.sanitize_inputs()
+ 
+         # load illustration data, required for creator metadata setup
+@@ -383,9 +528,10 @@ class StackExchangeToZim:
+             .config_verbose(context.debug)
+         )
+ 
+-        # "Dummy" progresser just for preparation step (we do not know yet total number
+-        # of questions)
+-        shared.progresser = Progresser(0)
++        # ASSEMBLE-ONLY: skip XML and all steps, build ZIM from staging
++        if context.assemble_only:
++            shared.progresser.print()
++            return self.assemble_zim()
+ 
+         logger.info("XML Dumps preparation")
+         ark_manager = ArchiveManager()
+@@ -396,7 +542,6 @@ class StackExchangeToZim:
+             logger.info("Requested preparation only; exiting")
+             return
+ 
+-        shared.progresser = Progresser(shared.total_questions)
+         shared.progresser.print()
+         return self.start()
+ 
+@@ -424,25 +569,32 @@ class StackExchangeToZim:
+ 
+             raise RuntimeError("End of debug shell session")
+ 
+-        shared.creator.start()
++        # STAGING MODE: skip ZIM creation, steps write to filesystem
++        is_staging = bool(context.stage_dir)
++        if not is_staging:
++            shared.creator.start()
+ 
+         try:
+-            self.add_illustrations()
+-            self.add_assets()
+-
+-            self.process_tags_metadata()
+-
+-            self.process_questions_metadata()
++            if not is_staging:
++                self.add_illustrations()
++                self.add_assets()
+ 
++            # PATCHED: Steps 2-4 already completed (data in Redis), skip to Step 5
++            # self.process_tags_metadata()
++            # self.process_questions_metadata()
+             self.process_indiv_users_pages()
+ 
+             self.process_questions()
+ 
+-            self.process_tags()
+-
+-            self.process_pages_lists()
++            # In staging mode: skip list pages and about page (generated during assembly)
++            if is_staging:
++                logger.info("Staging complete. Run with --assemble-only to build ZIM.")
++            else:
++                self.process_tags()
++                self.process_pages_lists()
+ 
+-            shared.imager.process_images()
++            if not context.without_images:
++                shared.imager.process_images()
+             shared.img_executor.join()
+ 
+             shared.executor.shutdown()
+@@ -451,8 +603,8 @@ class StackExchangeToZim:
+             shared.database.teardown()
+             shared.database.remove()
+         except Exception as exc:
+-            # request Creator not to create a ZIM file on finish
+-            shared.creator.can_finish = False
++            if not is_staging:
++                shared.creator.can_finish = False
+             if isinstance(exc, KeyboardInterrupt):
+                 logger.error("KeyboardInterrupt, exiting.")
+             else:
+@@ -463,16 +615,16 @@ class StackExchangeToZim:
+             shared.img_executor.shutdown(wait=False)
+             return 1
+         else:
+-            logger.info("Finishing ZIM file…")
+-            # we need to release libzim's resources.
+-            # currently does nothing but crash if can_finish=False but that's awaiting
+-            # impl. at libkiwix level
+-            with shared.lock:
+-                shared.creator.finish()
+-            logger.info(
+-                f"Finished Zim {shared.creator.filename.name} "
+-                f"in {shared.creator.filename.parent}"
+-            )
++            if is_staging:
++                logger.info("Staging complete. Run with --assemble-only to build ZIM.")
++            else:
++                logger.info("Finishing ZIM file…")
++                with shared.lock:
++                    shared.creator.finish()
++                logger.info(
++                    f"Finished Zim {shared.creator.filename.name} "
++                    f"in {shared.creator.filename.parent}"
++                )
+         finally:
+             shared.progresser.print()
+ 
+@@ -551,23 +703,23 @@ class StackExchangeToZim:
+         TagGenerator().run()
+ 
+     def process_pages_lists(self):
+-        # compute expected number of items to add to Zim (for progress)
+-        nb_user_pages = shared.usersdatabase.nb_users / NB_USERS_PER_PAGE
+-        nb_user_pages = int(
+-            nb_user_pages if nb_user_pages < NB_USERS_PAGES else NB_USERS_PAGES
+-        )
+-        nb_question_pages = int(
+-            shared.database.get_set_count(shared.postsdatabase.questions_key())
+-            / NB_QUESTIONS_PER_PAGE
+-        )
+-        nb_question_pages = (
+-            nb_question_pages
+-            if nb_question_pages < NB_QUESTIONS_PAGES
+-            else NB_QUESTIONS_PAGES
+-        )
++        try:
++            # compute expected number of items to add to Zim (for progress)
++            nb_users = getattr(shared.usersdatabase, 'nb_users', 0) or 0
++            nb_user_pages = max(0, int(nb_users / max(1, NB_USERS_PER_PAGE)))
++            nb_user_pages = min(nb_user_pages, NB_USERS_PAGES)
++            nb_question_pages = max(0, int(
++                shared.database.get_set_count(shared.postsdatabase.questions_key())
++                / max(1, NB_QUESTIONS_PER_PAGE)
++            ))
++            nb_question_pages = min(nb_question_pages, NB_QUESTIONS_PAGES)
++        except Exception as exc:
++            logger.warning(f"Could not compute page counts: {exc}")
++            nb_user_pages = nb_question_pages = 0
++        nb_total = max(1, nb_user_pages + nb_question_pages + 1)
+         shared.progresser.start(
+             shared.progresser.LISTS_STEP,
+-            nb_total=nb_user_pages + nb_question_pages + 1,
++            nb_total=nb_total,
+         )
+ 
+         logger.info("Generating Users page")
+@@ -596,3 +748,215 @@ class StackExchangeToZim:
+         logger.info(".. done")
+ 
+         shared.progresser.print()
++
++    def assemble_zim(self):
++        """Assemble ZIM from staged content in context.stage_dir.
++
++        Walks the staging tree, reads rendered HTML and metadata,
++        adds items to Creator, and finishes the ZIM.
++        List pages (questions, tags, users, about) are generated from Redis state.
++        """
++        stage_root = Path(context.stage_dir)
++        html_root = stage_root / "html"
++
++        if not html_root.exists():
++            logger.error(f"Staging directory not found: {html_root}")
++            return 1
++
++        shared.creator.start()
++
++        try:
++            self.add_illustrations()
++            self.add_assets()
++        except Exception as exc:
++            logger.warning(f"Live asset download failed (continuing): {exc} — can_finish not reset (corruption surfaces explicitly)")
++
++        # Guard: check can_finish remained True after asset loading
++        if not getattr(shared.creator, "can_finish", False):
++            logger.error("can_finish became False during asset loading — ZIM will be empty!")
++            logger.warning("Not resetting can_finish: corruption must surface explicitly at finish()")
++
++        # Walk staging tree and add to ZIM in one pass
++        logger.info("Walking staging tree + adding to ZIM...")
++        total_expected = shared.database.get_set_count(shared.postsdatabase.questions_key()) or 24152540
++        shared.progresser.start(
++            shared.progresser.QUESTIONS_STEP, nb_total=total_expected
++        )
++        total = 0
++        skipped = 0
++        for dirpath, dirs, files in os.walk(str(html_root), topdown=True):
++            if "index.html" not in files:
++                continue
++            html_path = Path(dirpath) / "index.html"
++            stage_dir = html_path.parent
++            try:
++                manifest = json.loads((stage_dir / "manifest.json").read_text())
++                zim_path = manifest["zim_path"]
++                title = manifest["title"]
++                html_content = self.sanitize_staged_html(html_path.read_text())
++            except Exception as exc:
++                logger.debug(f"Skipping staged page {dirpath}: {exc}")
++                skipped += 1
++                continue
++
++            post_id = stage_dir.name
++            safe_title = self.sanitize_zim_title(title, post_id)
++            if safe_title != title:
++                logger.debug(f"Sanitized title for {zim_path}: {title!r} -> {safe_title!r}")
++            with shared.lock:
++                shared.creator.add_item_for(
++                    path=zim_path, title=safe_title,
++                    content=html_content, mimetype="text/html",
++                    # Question pages are the primary articles. Mark them as front
++                    # so Kiwix random article lands on real questions.
++                    is_front=True,
++                )
++                shared.creator.add_redirect(
++                    path=f"questions/{post_id}", target_path=zim_path
++                )
++                for answer_id in manifest.get("answer_redirects", []):
++                    shared.creator.add_redirect(
++                        path=f"a/{answer_id}", target_path=zim_path
++                    )
++            total += 1
++            if total % 100000 == 0:
++                shared.progresser.update(incr=100000)
++                logger.info(f"  Added {total} questions to ZIM...")
++        shared.progresser.update(incr=total % 100000 or 100000)
++        logger.info(f"Added {total} questions to ZIM")
++        if skipped:
++            logger.info(f"Skipped {skipped} unreadable staged pages")
++        if total == 0:
++            logger.error("No questions were added to ZIM — build will be empty!")
++        elif total < 10000000:
++            logger.warning(f"Only {total} questions added (expected ~24M) — staging may be incomplete")
++
++            # Generate list pages from Redis (must have --keep-redis from staging run)
++        # Check Redis score data FIRST (before try block, so we know even if processing fails)
++        try:
++            redis_has_scores = shared.database.get_set_count(
++                shared.postsdatabase.questions_key()
++            ) > 0
++        except Exception:
++            redis_has_scores = False
++
++        try:
++            self.process_tags()
++        except Exception as exc:
++            logger.warning(f"Tag pages generation failed: {exc} (continuing)")
++
++        try:
++            self.process_pages_lists()
++        except Exception as exc:
++            logger.warning(f"List pages generation failed: {exc} (continuing)")
++
++        # Only use staging fallback if Redis score data is missing
++        if not redis_has_scores:
++            try:
++                logger.info("Redis scores missing — generating staging-based questions page...")
++                self.generate_questions_from_staging(stage_root)
++            except Exception as exc2:
++                logger.warning(f"Staging questions list also failed: {exc2}")
++        else:
++            logger.info("Redis scores present — using Redis-generated questions page")
++
++        # Add staged images to ZIM unless building no-pic archive.
++        img_root = stage_root / "images"
++        if context.without_images:
++            logger.info("Skipping staged images (--without-images)")
++        elif img_root.exists():
++            import magic  # python-magic for content-based MIME detection
++            staged_imgs = list(img_root.iterdir())
++            logger.info(f"Adding {len(staged_imgs)} staged images to ZIM")
++            for img_path in staged_imgs:
++                if img_path.suffix == ".tmp" or not img_path.is_file():
++                    continue
++                raw = img_path.read_bytes()
++                mime = magic.from_buffer(raw, mime=True) or "image/jpeg"
++                with shared.lock:
++                    shared.creator.add_item_for(
++                        path=f"images/{img_path.name}",
++                        content=raw,
++                        mimetype=mime,
++                        is_front=False,
++                    )
++
++        logger.info("Finishing ZIM file…")
++        with shared.lock:
++            shared.creator.finish()
++
++        # VERIFY: make sure the ZIM was actually written
++        zim_file = shared.creator.filename
++        if not zim_file.exists() or zim_file.stat().st_size == 0:
++            logger.error(f"ZIM file missing or empty after finish! {{{zim_file}}}")
++            logger.error(f"  can_finish was: {getattr(shared.creator, 'can_finish', 'N/A')}")
++            return 1
++
++        zim_size = zim_file.stat().st_size
++        logger.info(
++            f"Finished Zim {zim_file.name} ({zim_size / 1e9:.1f} GB)"
++            f" in {zim_file.parent}"
++        )
++
++        shared.progresser.print()
++
++        return 0
++
++    def generate_questions_from_staging(self, stage_root):
++        """Generate a questions list page from staging manifest files (fallback)."""
++        import random
++        html_root = stage_root / "html"
++
++        # Collect a few thousand questions from staging
++        items = []
++        count = 0
++        for dirpath, dirs, files in os.walk(str(html_root), topdown=True):
++            if "manifest.json" not in files:
++                continue
++            try:
++                manifest = json.loads((Path(dirpath) / "manifest.json").read_text())
++                items.append({
++                    "id": int(Path(dirpath).name),
++                    "title": manifest.get("title", ""),
++                    "zim_path": manifest.get("zim_path", ""),
++                })
++                count += 1
++                if count >= NB_PAGINATED_QUESTIONS:
++                    break
++            except Exception:
++                continue
++
++        if not items:
++            logger.warning("No questions found in staging for list page")
++            return
++
++        # Sort by ID descending (newest first)
++        items.sort(key=lambda x: x["id"], reverse=True)
++
++        # Generate simple HTML
++        links = []
++        for item in items:
++            links.append(
++                f'<li><a href="./{item["zim_path"]}">'
++                f'{item["title"]}</a></li>'
++            )
++
++        page_html = f"""<!DOCTYPE html>
++<html><head><meta charset="utf-8">
++<title>Stack Overflow - Questions</title>
++<link rel="stylesheet" href="./static/css/stacks.css">
++</head><body>
++<h1>Stack Overflow Questions</h1>
++<p>{len(items)} questions (newest first)</p>
++<ul>{"".join(links)}</ul>
++</body></html>"""
++
++        with shared.lock:
++            shared.creator.add_item_for(
++                path="questions",
++                content=page_html,
++                mimetype="text/html",
++                title="Highest Voted Questions",
++                is_front=False,
++            )
++        logger.info(f"Generated questions list page with {len(items)} entries")
+diff --git a/src/sotoki/utils/html.py b/src/sotoki/utils/html.py
+index 04bcada..5461849 100644
+--- a/src/sotoki/utils/html.py
++++ b/src/sotoki/utils/html.py
+@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
+ 
+ import bs4
+ import mistune
+-import regex
+ from slugify import slugify
+ from tld import get_fld
+ 
+@@ -32,7 +31,7 @@ def get_text(content: str, strip_at: int = -1):
+     # Normalize whitespace: replace all whitespace sequences with single space
+     text = " ".join(text.split())
+     if strip_at > 0 and len(text) > strip_at:
+-        text = f"{text[0:strip_at].rsplit(' ', 1)[0]}…"
++        text = f'{text[0:strip_at].rsplit(" ", 1)[0]}…'
+     # Escape HTML entities so the text is safe to use in HTML documents
+     return html.escape(text)
+ 
+@@ -167,10 +166,6 @@ class Rewriter:
+             escape=False,
+             plugins=["strikethrough", "table", "footnotes"],
+         )
+-        self.markdown_comment = mistune.create_markdown(
+-            escape=True,
+-            plugins=["strikethrough", "table", "footnotes"],
+-        )
+         if context.censor_words_list:
+             with open(shared.build_dir.joinpath("words.list")) as fh:
+                 # this will actually replace occurences of ~strings matching
+@@ -209,25 +204,22 @@ class Rewriter:
+         cases like Comments.
+ 
+         """
++        # Content might be empty
+         content = content.strip()
+         if not content:
+             return ""
+ 
+-        gen_markdown = self.markdown(content)
+-        if not isinstance(gen_markdown, str):
+-            raise Exception(f"Unexpected gen_markdown type: {gen_markdown.__class__}")
+-
+-        return self._rewrite_html(gen_markdown, to_root=to_root, unwrap=unwrap)
+-
+-    def _rewrite_html(
+-        self, content: str, to_root: str = "", *, unwrap: bool = False
+-    ) -> str:
+-        """Parse and rewrite an HTML string to comply with ZIM and options.
+-
+-        This is the BS4 half of rewrite(). Kept separate so rewrite_comment()
+-        can call it directly without triggering a second mistune pass (issue #398).
+-        """
+-        soup = bs4.BeautifulSoup(content, "lxml")
++        try:
++            gen_markdown = self.markdown(content)
++            if not isinstance(gen_markdown, str):
++                raise Exception(
++                    f"Unexpected gen_markdown type: {gen_markdown.__class__}"
++                )
++            soup = bs4.BeautifulSoup(gen_markdown, "lxml")
++            # soup = BeautifulSoup(content, "lxml")
++        except Exception as exc:
++            logger.error(f"Unable to init soup or markdown for {content}: {exc}")
++            return content
+ 
+         if not soup:
+             return ""
+@@ -254,6 +246,7 @@ class Rewriter:
+             self.rewrite_code(soup)
+ 
+         self.rewrite_links(soup, to_root)
++
+         self.rewrite_images(soup, to_root)
+ 
+         # apply censorship rewriting
+@@ -264,32 +257,8 @@ class Rewriter:
+         soup.decompose()
+         return result
+ 
+-    def rewrite_comment(self, content: str, to_root: str = "") -> str:
+-        """Rewrite comment text for display in ZIM.
+-
+-        Uses escape=True mistune so angle brackets in code spans like
+-        `BufReader<Input>` are escaped (issue #391).
+-
+-        Calls _rewrite_html() directly to avoid a second mistune pass
+-        that would occur if rewrite() were called here (issue #398).
+-        """
+-        content = content.strip()
+-        if not content:
+-            return ""
+-
+-        gen_markdown = self.markdown_comment(content)
+-        if not isinstance(gen_markdown, str):
+-            raise Exception(
+-                f"Unexpected markdown_comment type: {gen_markdown.__class__}"
+-            )
+-
+-        return self._rewrite_html(gen_markdown, to_root=to_root, unwrap=True)
+-
+     def rewrite_string(self, content: str) -> str:
+         """rewritten single-string using non-markup-related rules"""
+-        # remove any control character
+-        content = regex.sub(r"\p{C}+", " ", content).strip()
+-        # replace censored words
+         if context.censor_words_list:
+             return self.words_re.sub(self.redacted_text, content)
+         return content
+@@ -297,6 +266,7 @@ class Rewriter:
+     def rewrite_links(self, soup, to_root):
+         # rewrite links targets
+         for link in soup.find_all("a", href=True):
++
+             # remove link to "" as the use of a <base /> in our template
+             # would turn it into a link to root
+             if not link.get("href", "").strip():
+@@ -454,9 +424,6 @@ class Rewriter:
+         # > rewrite to users/{uId}/{slug}
+         uid_slug_m = self.uid_re.match(uri_path)
+         if uid_slug_m:
+-            if context.without_user_profiles:
+-                del link.attrs["href"]
+-                return
+             uid = uid_slug_m.groupdict().get("user_id")
+             if not isinstance(uid, str):
+                 raise Exception(f"Unexpected uid type: {uid.__class__}")
+@@ -534,6 +501,7 @@ class Rewriter:
+                 del img.attrs["src"]
+             # process all images
+             else:
++
+                 # skip links inside <code /> nodes
+                 if is_in_code(img):
+                     continue
+@@ -588,9 +556,8 @@ class Rewriter:
+         # now apply filtering on tag attributes. As per SE rules, users can only
+         # set `alt` and `title` on <img />` and `title` on `<a />`
+         for tag in soup.find_all(
+-            lambda x: (
+-                x.name in ("a", "img") and (x.has_attr("title") or x.has_attr("alt"))
+-            )
++            lambda x: x.name in ("a", "img")
++            and (x.has_attr("title") or x.has_attr("alt"))
+         ):
+             for attr in ("title", "alt"):
+                 if tag.attrs.get(attr):
+-- 
+2.55.0
+

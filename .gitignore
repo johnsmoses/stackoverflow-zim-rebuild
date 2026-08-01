@@ -31,3 +31,5 @@ __pycache__/
 
 # Node (unused for now, kept for future tooling)
 node_modules/
+# Stage-1 forensic capture evidence
+capture/

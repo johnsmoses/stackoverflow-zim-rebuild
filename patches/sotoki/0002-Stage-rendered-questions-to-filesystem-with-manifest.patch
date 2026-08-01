@@ -1,0 +1,422 @@
+From fd6f355684d5219bbc1561811a15256c96247d81 Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:13:28 -0400
+Subject: [PATCH 2/5] Stage rendered questions to filesystem with manifest
+ checkpointing
+
+---
+ src/sotoki/posts.py                | 145 ++++++++++++++++++++++-------
+ src/sotoki/utils/database/posts.py | 136 ++++++++++++++++++++++++---
+ 2 files changed, 235 insertions(+), 46 deletions(-)
+
+diff --git a/src/sotoki/posts.py b/src/sotoki/posts.py
+index 35bfa41..20222ff 100644
+--- a/src/sotoki/posts.py
++++ b/src/sotoki/posts.py
+@@ -3,6 +3,9 @@ import datetime
+ import re
+ from typing import Any
+ 
++from pathlib import Path
++from zimscraperlib.typing import Callback
++
+ from sotoki.constants import NB_PAGINATED_QUESTIONS, NB_QUESTIONS_PER_PAGE
+ from sotoki.renderer import SortedSetPaginator
+ from sotoki.utils.generator import Generator, Walker
+@@ -13,9 +16,12 @@ from sotoki.utils.shared import context, logger, shared
+ def harmonize_post(post: dict):
+     post["has_accepted"] = "AcceptedAnswerId" in post
+     post["OwnerName"] = post.get("OwnerUserId", post.get("OwnerDisplayName"))
+-    post["CreationTimestamp"] = int(
+-        datetime.datetime.fromisoformat(post["CreationDate"]).strftime("%s")
+-    )
++    if post.get("CreationDate"):
++        post["CreationTimestamp"] = int(
++            datetime.datetime.fromisoformat(post["CreationDate"]).strftime("%s")
++        )
++    else:
++        post["CreationTimestamp"] = 0
+     # split either by | or by >< (some dumps use the |tag1|tag2| format,
+     # others use the <tag1><tag2> format)
+     post["Tags"] = re.split(r"\||><", post["Tags"][1:-1])
+@@ -27,7 +33,7 @@ class WalkerWithTrigger(Walker):
+ 
+     def check_trigger(self):
+         self.seen += 1
+-        if self.seen % 10000 == 0:
++        if self.seen % 50000 == 0:
+             logger.debug(f"Seen {self.seen}")
+             shared.collect()
+ 
+@@ -42,8 +48,8 @@ class FirstPassWalker(WalkerWithTrigger):
+         if name == "post":
+             # store xml data until we're through with the <post /> node
+             self.post: dict[str, Any] = dict(attrs.items())
+-            self.post["Id"] = int(self.post["Id"])
+-            self.post["Score"] = int(self.post["Score"])
++            self.post["Id"] = int(self.post.get("Id") or 0)
++            self.post["Score"] = int(self.post.get("Score") or 0)
+             self.post["Tags"] = self.post.get("Tags", "")
+             self.post["users_ids"] = set()
+             self.post["nb_answers"] = 0
+@@ -148,23 +154,47 @@ class PostsWalker(WalkerWithTrigger):
+         </links>
+     </post>"""
+ 
++    # Set of already-completed post IDs for resume (populated by PostGenerator)
++    done_set: set = set()
++
+     def startDocument(self):  # noqa: N802
+         super().startDocument()
+         self.currently_in = None
+         self.post = {}
+         self.comments = []
+         self.answers = []
++        self._skip_current = False
+ 
+     def startElement(self, name, attrs):  # noqa: N802
++        # Resume skip: if currently skipping a done post, ignore everything
++        if self._skip_current:
++            return
++
+         # a question
+         if name == "post":
+-            # store xml data until we're through with the <post /> node
+             self.currently_in = "post"
+             self.post: dict[str, Any] = dict(attrs.items())
+-            self.post["Id"] = int(self.post["Id"])
+-            self.post["Score"] = int(self.post["Score"])
++            self.post["Id"] = int(self.post.get("Id") or 0)
++
++            # Resume: skip if already staged AND file exists
++            if self.post["Id"] in self.done_set:
++                # Verify the staged file actually exists
++                hex_prefix = f"{self.post['Id']:08x}"[:2]
++                stage_check = Path(context.stage_dir) / "html" / hex_prefix / str(self.post["Id"]) / "index.html"
++                if stage_check.exists():
++                    self._skip_current = True
++                    if len(self.done_set) > 0 and self.post["Id"] % 50000 == 0:
++                        logger.debug(f"Skipping already-staged question {self.post['Id']}")
++                    return
++                else:
++                    # File missing — remove from done set so it gets re-rendered
++                    shared.database.safe_command("SREM", "stage:done:questions", self.post["Id"])
++                    logger.debug(f"Re-rendering {self.post['Id']} (staged file missing)")
++
++            self.post["Score"] = int(self.post.get("Score") or 0)
+             self.post["Tags"] = self.post.get("Tags", "")
+             self.post["links"] = {"linked": [], "duplicate": []}
++            self.post["answers"] = []
+             return
+ 
+         # opening comments of a question
+@@ -229,9 +259,15 @@ class PostsWalker(WalkerWithTrigger):
+             self.post["comments"] = self.comments
+ 
+         if name == "post":
++            # Resume: clear skip flag at closing tag
++            if self._skip_current:
++                self._skip_current = False
++                self.check_trigger()
++                return
++
+             if self.post.get("answers"):
+                 self.post["answers"].sort(
+-                    key=lambda item: int(item["Score"]), reverse=True
++                    key=lambda item: int(item.get("Score") or 0), reverse=True
+                 )
+ 
+             # defer processing to workers
+@@ -257,9 +293,19 @@ class PostGenerator(Generator):
+     def fpath(self):
+         return shared.build_dir / "posts_complete.xml"
+ 
++    def run(self):
++        # On resume: load already-completed question IDs from Valkey
++        if context.resume and context.stage_dir:
++            done = shared.database.safe_command("SMEMBERS", "stage:done:questions")
++            PostsWalker.done_set = set(int(x) for x in done if x)
++            logger.info(f"Resume: {len(PostsWalker.done_set)} questions already staged")
++        else:
++            PostsWalker.done_set = set()
++        super().run()
++
+     def processor(self, item):
+         post = item
+-        if context.without_unanswered and not post["answers"]:
++        if context.without_unanswered and not post.get("answers"):
+             self.release()
+             return
+         # ignore deleted posts
+@@ -268,31 +314,66 @@ class PostGenerator(Generator):
+             return
+         harmonize_post(post)
+ 
+-        path = f'questions/{post["Id"]}/{get_slug_for(post["Title"])}'
+-        # prepare post page outside Lock to prevent dead-lock on image discovery
+-        post_page = shared.renderer.get_question(post)
+-        with shared.lock:
+-            shared.creator.add_item_for(
+-                path=path,
+-                title=shared.rewriter.rewrite_string(post.get("Title")),
+-                content=post_page,
+-                mimetype="text/html",
+-                is_front=True,
+-            )
+-            shared.creator.add_redirect(
+-                path=f'questions/{post["Id"]}',
+-                target_path=path,
+-            )
+-        del post_page
+-
+-        for answer in post.get("answers", []):
++        post_id = post["Id"]
++        slug = get_slug_for(post["Title"])
++        path = f'questions/{post_id}/{slug}'
++
++        if context.stage_dir:
++            # STAGING MODE: write to filesystem, checkpoint in Valkey
++            stage_root = Path(context.stage_dir)
++            hex_prefix = f"{post_id:08x}"[:2]
++            stage_path = stage_root / "html" / hex_prefix / str(post_id)
++            stage_path.mkdir(parents=True, exist_ok=True)
++
++            post_page = shared.renderer.get_question(post)
++
++            # Render redirect info for answers
++            answer_redirects = []
++            for answer in post.get("answers", []):
++                answer_redirects.append(str(answer["Id"]))
++
++            # Atomic write: HTML first, then manifest
++            html_tmp = stage_path / ".index.html.tmp"
++            html_tmp.write_text(post_page)
++            html_tmp.rename(stage_path / "index.html")
++
++            import json
++            manifest = {
++                "title": shared.rewriter.rewrite_string(post.get("Title") or ""),
++                "zim_path": path,
++                "answer_redirects": answer_redirects,
++            }
++            manifest_tmp = stage_path / ".manifest.json.tmp"
++            manifest_tmp.write_text(json.dumps(manifest))
++            manifest_tmp.rename(stage_path / "manifest.json")
++
++            # Mark done in Valkey
++            shared.database.safe_command("SADD", "stage:done:questions", post_id)
++            del post_page
++        else:
++            # ORIGINAL: write directly to ZIM
++            post_page = shared.renderer.get_question(post)
+             with shared.lock:
++                shared.creator.add_item_for(
++                    path=path,
++                    title=shared.rewriter.rewrite_string(post.get("Title")),
++                    content=post_page,
++                    mimetype="text/html",
++                    is_front=True,
++                    callbacks=[Callback(func=self.release)],
++                )
+                 shared.creator.add_redirect(
+-                    path=f'a/{answer["Id"]}',
++                    path=f'questions/{post["Id"]}',
+                     target_path=path,
+                 )
+-
+-        self.release()
++            del post_page
++
++            for answer in post.get("answers", []):
++                with shared.lock:
++                    shared.creator.add_redirect(
++                        path=f'a/{answer["Id"]}',
++                        target_path=path,
++                    )
+ 
+     def generate_questions_page(self):
+         paginator = SortedSetPaginator(
+diff --git a/src/sotoki/utils/database/posts.py b/src/sotoki/utils/database/posts.py
+index 6621743..0593e8f 100644
+--- a/src/sotoki/utils/database/posts.py
++++ b/src/sotoki/utils/database/posts.py
+@@ -2,11 +2,14 @@
+ 
+ import datetime
+ import json
++import re
++from functools import lru_cache
++from pathlib import Path
+ 
+ import snappy
+ 
+ from sotoki.utils.html import get_text
+-from sotoki.utils.shared import shared
++from sotoki.utils.shared import context, shared
+ 
+ 
+ class PostsDatabase:
+@@ -50,6 +53,84 @@ class PostsDatabase:
+     def questions_stats_key():
+         return "questions_stats"
+ 
++    @staticmethod
++    @lru_cache(maxsize=200000)
++    def get_staged_question_fallback(post_id: str) -> dict:
++        """Best-effort metadata fallback from staged manifest/html.
++
++        Assemble-only builds can have Redis score sets but miss Q:/QD: detail keys.
++        Without those keys list pages render as title=None, date=1970, slug=none.
++        Staging contains enough metadata for list pages, so lazily read only the
++        questions actually rendered by paginated home/tag pages.
++        """
++        post_id = str(post_id)
++        try:
++            shard = f"{int(post_id) >> 24:02x}"
++        except Exception:
++            shard = "00"
++        qdir = Path(context.stage_dir) / "html" / shard / post_id
++        manifest_path = qdir / "manifest.json"
++        html_path = qdir / "index.html"
++
++        out = {
++            "title": None,
++            "excerpt": "",
++            "creation_date": datetime.datetime.fromtimestamp(0, datetime.UTC),
++            "owner_user_id": "",
++            "has_accepted": False,
++            "nb_answers": 0,
++            "tags": [],
++        }
++
++        try:
++            manifest = json.loads(manifest_path.read_text())
++            out["title"] = manifest.get("title")
++        except Exception:
++            manifest = {}
++
++        try:
++            html = html_path.read_text(errors="ignore")
++        except Exception:
++            html = ""
++
++        if html:
++            # First paragraph-ish excerpt from rendered question body.
++            m = re.search(r'<div class="s-prose js-post-body"[^>]*>(.*?)</div>', html, re.S)
++            if m:
++                excerpt = re.sub(r"<[^>]+>", " ", m.group(1))
++                excerpt = re.sub(r"\s+", " ", excerpt).strip()
++                out["excerpt"] = excerpt[:250]
++
++            # Main question asked timestamp and owner display/id.
++            m = re.search(
++                r'<time class="s-user-card--time" datetime="asked ([^"]+)">.*?</time>.*?'
++                r'<div class="s-user-card--info">\s*(?:<a [^>]*>)?([^<]+)',
++                html,
++                re.S,
++            )
++            if m:
++                asked, owner = m.group(1).strip(), m.group(2).strip()
++                out["owner_user_id"] = owner
++                for fmt in ("%b %d '%y at %H:%M", "%b %-d '%y at %H:%M"):
++                    try:
++                        out["creation_date"] = datetime.datetime.strptime(asked, fmt).replace(tzinfo=datetime.UTC)
++                        break
++                    except Exception:
++                        pass
++
++            m = re.search(r'itemprop="answerCount">(\d+)</span>', html)
++            if not m:
++                m = re.search(r'data-answercount="(\d+)"', html)
++            if m:
++                out["nb_answers"] = int(m.group(1))
++                out["has_accepted"] = "accepted-answer" in html or "answered-accepted" in html
++
++            tags = re.findall(r'href="\.\./\.\./questions/tagged/([^"]+)"[^>]*class="post-tag', html)
++            if tags:
++                out["tags"] = tags
++
++        return out
++
+     def record_question(self, post: dict):
+ 
+         # update set of users_ids (users with activity)
+@@ -131,10 +212,9 @@ class PostsDatabase:
+                 )
+             )
+         except Exception:
+-            # we might not have a record for that post_id:
+-            # - post_id can be erroneous (from a mistyped link)
+-            # - post_id can reference an excluded question (no answer)
+-            data = [None, None]
++            # assemble-only fallback: detail key may be absent while staged HTML exists
++            fallback = self.get_staged_question_fallback(str(post_id))
++            data = [fallback.get("title"), fallback.get("excerpt", "")]
+         return {"title": data[0], "excerpt": data[1]}
+ 
+     def get_question_details(self, post_id, score: int | None = None):
+@@ -150,16 +230,43 @@ class PostsDatabase:
+ 
+         post_entry = shared.database.safe_get(self.question_key(post_id))
+         if post_entry:
+-            (
+-                item["creation_date"],
+-                item["owner_user_id"],
+-                item["has_accepted"],
+-                item["nb_answers"],
+-                item["tags"],
+-            ) = json.loads(snappy.decompress(post_entry))
++            data = json.loads(snappy.decompress(post_entry))
++            if isinstance(data, dict):
++                item["creation_date"] = data.get("creation_date", 0)
++                item["owner_user_id"] = data.get("owner_user_id")
++                item["has_accepted"] = data.get("has_accepted", False)
++                item["nb_answers"] = data.get("nb_answers", 0)
++                item["tags"] = data.get("tags", "") or []
++            else:
++                (
++                    item["creation_date"],
++                    item["owner_user_id"],
++                    item["has_accepted"],
++                    item["nb_answers"],
++                    item["tags"],
++                ) = data
++        else:
++            # Defaults/fallback when question metadata is missing from Redis.
++            fallback = self.get_staged_question_fallback(str(post_id))
++            if not item.get("title"):
++                item["title"] = fallback.get("title")
++            if not item.get("excerpt"):
++                item["excerpt"] = fallback.get("excerpt", "")
++            item["creation_date"] = fallback.get(
++                "creation_date", datetime.datetime.fromtimestamp(0, datetime.UTC)
++            )
++            item["owner_user_id"] = fallback.get("owner_user_id", "")
++            item["has_accepted"] = fallback.get("has_accepted", False)
++            item["nb_answers"] = fallback.get("nb_answers", 0)
++            item["tags"] = fallback.get("tags", [])
++
++        if not isinstance(item["creation_date"], datetime.datetime):
+             item["creation_date"] = datetime.datetime.fromtimestamp(
+-                item["creation_date"], datetime.UTC
++                item["creation_date"] or 0, datetime.UTC
+             )
++        if isinstance(item["tags"], str):
++            item["tags"] = [t for t in item["tags"].split() if t]
++        if item["tags"] and isinstance(item["tags"][0], int):
+             item["tags"] = [
+                 shared.tagsdatabase.get_tag_name_for(t) for t in item["tags"]
+             ]
+@@ -167,7 +274,8 @@ class PostsDatabase:
+ 
+     def get_question_score(self, post_id: int) -> int:
+         """Score of a question by PostId"""
+-        return int(shared.database.safe_zscore(self.questions_key(), int(post_id)))
++        score = shared.database.safe_zscore(self.questions_key(), int(post_id))
++        return int(score) if score is not None else 0
+ 
+     def question_has_accepted_answer(self, post_id: int) -> bool:
+         """Whether the question has an accepted answer or not"""
+-- 
+2.55.0
+

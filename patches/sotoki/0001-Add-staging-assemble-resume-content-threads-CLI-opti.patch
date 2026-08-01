@@ -1,0 +1,87 @@
+From 740baacfbb9c05937708b245db60ba7450e05daa Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:13:25 -0400
+Subject: [PATCH 1/5] Add staging/assemble/resume/content-threads CLI options
+ and context fields
+
+---
+ src/sotoki/context.py    |  6 ++++++
+ src/sotoki/entrypoint.py | 32 ++++++++++++++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/src/sotoki/context.py b/src/sotoki/context.py
+index ffbcbfb..87a71db 100644
+--- a/src/sotoki/context.py
++++ b/src/sotoki/context.py
+@@ -49,8 +49,14 @@ class Context:
+ 
+     # performances
+     nb_threads: int = 1
++    content_threads: int = 0  # 0 = auto (os.cpu_count() or 3)
+     s3_url_with_credentials: str | None = ""
+ 
++    # staging (resumable architecture)
++    stage_dir: str = ""
++    assemble_only: bool = False
++    resume: bool = False
++
+     # censorship
+     censor_words_list: str = ""
+     without_images: bool = False
+diff --git a/src/sotoki/entrypoint.py b/src/sotoki/entrypoint.py
+index 3363ac9..4072a51 100644
+--- a/src/sotoki/entrypoint.py
++++ b/src/sotoki/entrypoint.py
+@@ -126,12 +126,19 @@ def prepare_context(raw_args: list[str]) -> None:
+ 
+     advanced.add_argument(
+         "--threads",
+-        help="Number of threads to use to handle tasks concurrently. "
+-        "Increase to speed-up I/O operations (disk, network). Default: 1",
++        help="Number of threads for IMAGE downloads. Default: 10",
+         type=int,
+         dest="nb_threads",
+     )
+ 
++    advanced.add_argument(
++        "--content-threads",
++        help="Number of threads for CONTENT rendering (questions, users, tags). "
++        "Default: auto (cpu count, min 3). CPU-bound, limited by Python GIL.",
++        type=int,
++        dest="content_threads",
++    )
++
+     advanced.add_argument(
+         "--tmp-dir",
+         help="Path to create temp folder in. Used for building ZIM file. "
+@@ -229,6 +236,27 @@ def prepare_context(raw_args: list[str]) -> None:
+         dest="open_shell",
+     )
+ 
++    advanced.add_argument(
++        "--stage-dir",
++        help="Directory for staging rendered content before ZIM assembly. "
++        "Enables resumable architecture. Implies --assemble-only mode later.",
++        dest="stage_dir",
++    )
++
++    advanced.add_argument(
++        "--assemble-only",
++        help="Skip rendering, assemble ZIM from staged content in --stage-dir",
++        action="store_true",
++        dest="assemble_only",
++    )
++
++    advanced.add_argument(
++        "--resume",
++        help="Resume from last checkpoint in Valkey (requires --stage-dir and --keep-redis)",
++        action="store_true",
++        dest="resume",
++    )
++
+     advanced.add_argument(
+         "--dev-skip-tags-meta",
+         help="Dev only. don't run tag metadata. assumes redis and dumps",
+-- 
+2.55.0
+

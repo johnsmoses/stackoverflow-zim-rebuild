@@ -7,11 +7,13 @@ upstream:
   base_commit: 157ca9a
 
 patch_series:
-  status: capture-pending   # capture-pending | captured | applied
+  status: captured   # capture-pending | captured | applied
   directory: patches/sotoki/
+  commit_count: 5
   note: >
-    Patches will be recorded here once captured from the working
-    site-packages install (Task 3). Each patch must apply cleanly on
+    5-patch series captured from the working site-packages install,
+    parameterized to remove machine-specific paths (see
+    patches/sotoki/README.md). Each patch must apply cleanly on
     base_commit; a patch failure on a newer upstream must be explicit.
 
 requirements:

@@ -1,0 +1,100 @@
+From 2c399df72a919a08b01111d0d074024960df274a Mon Sep 17 00:00:00 2001
+From: johnsmoses <jmoses323@gmail.com>
+Date: Sat, 1 Aug 2026 18:13:31 -0400
+Subject: [PATCH 5/5] Bound sort buffer and throttle Redis pipeline flushes
+
+---
+ src/sotoki/utils/database/redisdb.py | 24 +++++++-----------------
+ src/sotoki/utils/preparation.py      |  8 +++++++-
+ 2 files changed, 14 insertions(+), 18 deletions(-)
+
+diff --git a/src/sotoki/utils/database/redisdb.py b/src/sotoki/utils/database/redisdb.py
+index eefa2a7..72c3719 100644
+--- a/src/sotoki/utils/database/redisdb.py
++++ b/src/sotoki/utils/database/redisdb.py
+@@ -15,7 +15,7 @@ from sotoki.utils.shared import context, logger
+ 
+ class RedisDatabase:
+ 
+-    commit_every = 1000
++    commit_every = 5000
+ 
+     def __init__(self, *, initialize: bool = False):
+         self.connections: dict[int, redis.Redis] = {}
+@@ -111,25 +111,15 @@ class RedisDatabase:
+                 threading.Event().wait(2)
+         return func(*args)
+ 
+-    def _execute_pipe_with_retry(self, pipe, retries: int = 20):
+-        """Pipeline execute() retried on ConnectionError"""
+-        attempt = 1
+-        while attempt < retries:
+-            try:
+-                return pipe.execute()
+-            except redis.exceptions.ConnectionError as exc:
+-                logger.error(f"Redis PIPE.EXECUTE Error #{attempt}/{retries}: {exc}")
+-                attempt += 1
+-                threading.Event().wait(2)
+-        return pipe.execute()
+-
+     def commit(self, *, done=False):
+-        self._execute_pipe_with_retry(self.pipe)
++        self.pipe.execute()
++
+         # make sure we've commited pipes on all thread-specific pipelines
+         if done:
+             time.sleep(2)  # prevent last-thread created while we iterate on mini domain
+             for pipe in self.pipes.values():
+-                self._execute_pipe_with_retry(pipe)
++                pipe.execute()
++                time.sleep(0.1)  # patched: throttle pipeline flushes to avoid connection reset
+ 
+     def purge(self):
+         """ask redis to reclaim dirty pages space. Effective only on Linux"""
+@@ -158,11 +148,10 @@ class RedisDatabase:
+ 
+     def dump(self):
+         """SAVE a dump on disk (as dump.rdb on CWD)"""
+-        self.conn.config_set("dir", str(context.tmp_dir))
+         self.conn.save()
+ 
+     def teardown(self):
+-        self._execute_pipe_with_retry(self.pipe)
++        self.pipe.execute()
+         self.conn.close()
+ 
+     def remove(self):
+@@ -188,6 +177,7 @@ class RedisDatabase:
+         def decode_results(results):
+             for result in results:
+                 if scored:
++                    # results is [(member_bytes, score_int), ...] from redis-py
+                     yield (result[0].decode(UTF8), result[1])
+                 else:
+                     yield result.decode(UTF8)
+diff --git a/src/sotoki/utils/preparation.py b/src/sotoki/utils/preparation.py
+index 38b3295..4bb314b 100644
+--- a/src/sotoki/utils/preparation.py
++++ b/src/sotoki/utils/preparation.py
+@@ -113,11 +113,17 @@ def sort_dump_by_id_gnusort(
+ 
+     Way faster than naive impl (~x7). Consumes _a lot_ of RAM (90% of avail)"""
+ 
++    tmpdir = os.environ.get("SOTOKI_SORT_TMP")
+     args = [
+         "/usr/bin/env",
+         "sort",
+         "--buffer-size",
+-        f"{int(get_available_memory() * .9)}b",
++        "32G",
++    ]
++    if tmpdir:
++        args.append("--temporary-directory")
++        args.append(tmpdir)
++    args += [
+         '--field-separator="',
+         f"--key={field_num + 1},{field_num + 1}n",  # from nth field to nth field, num
+         f"--output={dst}",
+-- 
+2.55.0
+
