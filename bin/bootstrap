@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# bootstrap — tool checks, WORK_ROOT skeleton + restore marker, sotoki build.
+#
+# 1. Verifies required tools and refuses to run as root.
+# 2. Creates $WORK_ROOT/{stage,out,tmp,cache,redis,mirror,assets,sotoki-src}
+#    and — only when WORK_ROOT was empty — writes the restore marker
+#    $WORK_ROOT/.sotoki-rebuild-ok (see docs/baseline-assets.md, marker
+#    gating). A non-empty, unrecognized WORK_ROOT is refused without the
+#    marker being written.
+# 3. Ensures a patched sotoki checkout: if SOTOKI_SOURCE_DIR is missing or
+#    not patched (fewer than 9 commits after base 157ca9a), clones
+#    openzim/sotoki, checks out 157ca9a, applies patches/sotoki/*.patch in
+#    series order, and installs it into SOTOKI_VENV.
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+# --- 1. refuse root --------------------------------------------------------
+[[ "$(id -u)" -ne 0 ]] || die "refusing to run as root"
+
+# --- 2. tool checks --------------------------------------------------------
+for t in python3 git sha256sum flock rsync curl; do
+  command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found in PATH"
+done
+if ! command -v 7z >/dev/null 2>&1 && ! command -v 7za >/dev/null 2>&1; then
+  die "required tool '7z' or '7za' not found in PATH"
+fi
+if ! command -v redis-server >/dev/null 2>&1 && ! command -v valkey-server >/dev/null 2>&1; then
+  die "required tool 'redis-server' or 'valkey-server' not found in PATH"
+fi
+python3 - <<'PY' || die "python3 >= 3.12 required"
+import sys
+sys.exit(0 if sys.version_info >= (3, 12) else 1)
+PY
+if command -v jq >/dev/null 2>&1; then
+  log "tool check OK (jq available)"
+else
+  log "tool check OK (WARNING: jq not found — optional, some helpers degrade)"
+fi
+
+# --- 3. WORK_ROOT skeleton + restore marker (D1) ---------------------------
+WORK_ROOT="$(canonical_path "$WORK_ROOT")"
+SOTOKI_SOURCE_DIR="$(canonical_path "$SOTOKI_SOURCE_DIR")"
+SOTOKI_VENV="$(canonical_path "$SOTOKI_VENV")"
+
+reject_dangerous_path WORK_ROOT "$WORK_ROOT"
+reject_symlinked_path WORK_ROOT "$WORK_ROOT"
+
+KNOWN_CHILDREN=(stage out tmp cache redis mirror sotoki-src assets .venv-sotoki .restore.lock .sotoki-rebuild-ok)
+
+MARKER="${WORK_ROOT}/.sotoki-rebuild-ok"
+
+mkdir -p "$WORK_ROOT"
+mapfile -t ENTRIES < <(ls -A "$WORK_ROOT" 2>/dev/null || true)
+EMPTY=1
+[[ "${#ENTRIES[@]}" -gt 0 ]] && EMPTY=0
+
+if [[ -f "$MARKER" ]]; then
+  log "restore marker already present ($MARKER)"
+elif [[ "$EMPTY" == 1 ]]; then
+  printf '%s\n' \
+    "restore marker: WORK_ROOT was created empty by bin/bootstrap" \
+    "created by: bin/bootstrap ($(date -u +%Y-%m-%dT%H:%M:%SZ))" \
+    "required for: --replace restores and future builds (make restore-baseline --replace, make update)" \
+    > "$MARKER"
+  log "created restore marker on empty WORK_ROOT ($MARKER)"
+else
+  unknown=()
+  for e in "${ENTRIES[@]}"; do
+    ok=0
+    for k in "${KNOWN_CHILDREN[@]}"; do
+      [[ "$e" == "$k" ]] && ok=1
+    done
+    [[ "$ok" == 1 ]] || unknown+=("$e")
+  done
+  if [[ "${#unknown[@]}" -gt 0 ]]; then
+    die "WORK_ROOT ($WORK_ROOT) is non-empty and unrecognized (entries: ${unknown[*]}); refusing to write the restore marker"
+  fi
+  log "WORK_ROOT non-empty but only known children; marker left absent (written after the first successful restore)"
+fi
+
+# Directory skeleton (only ever created here; restore-baseline fills them).
+mkdir -p "${WORK_ROOT}"/{stage,out,tmp,cache,redis,mirror,assets,sotoki-src}
+log "WORK_ROOT skeleton ready: $WORK_ROOT"
+
+# --- 4. patched sotoki -----------------------------------------------------
+is_patched() {
+  local d="$1" n
+  git -C "$d" rev-parse --verify --quiet 157ca9a^{commit} >/dev/null 2>&1 || return 1
+  n="$(git -C "$d" rev-list --count 157ca9a..HEAD 2>/dev/null || echo 0)"
+  [[ "$n" -ge 9 ]]
+}
+
+NEEDS_BUILD=0
+if [[ ! -d "$SOTOKI_SOURCE_DIR" ]]; then
+  NEEDS_BUILD=1
+elif ! is_patched "$SOTOKI_SOURCE_DIR"; then
+  if [[ -n "$(ls -A "$SOTOKI_SOURCE_DIR" 2>/dev/null || true)" ]]; then
+    die "SOTOKI_SOURCE_DIR exists but is not a patched sotoki checkout (fewer than 9 commits after 157ca9a); remove it or point SOTOKI_SOURCE_DIR elsewhere"
+  fi
+  NEEDS_BUILD=1
+fi
+
+if [[ "$NEEDS_BUILD" == 1 ]]; then
+  log "cloning openzim/sotoki (base 157ca9a) into $SOTOKI_SOURCE_DIR"
+  git clone https://github.com/openzim/sotoki "$SOTOKI_SOURCE_DIR"
+  git -C "$SOTOKI_SOURCE_DIR" checkout 157ca9a
+
+  # git am needs an identity; fall back to a neutral local one if unset.
+  if [[ -z "$(git -C "$SOTOKI_SOURCE_DIR" config user.name 2>/dev/null || true)" ]]; then
+    git -C "$SOTOKI_SOURCE_DIR" config user.name "stackoverflow-zim-rebuild"
+  fi
+  if [[ -z "$(git -C "$SOTOKI_SOURCE_DIR" config user.email 2>/dev/null || true)" ]]; then
+    git -C "$SOTOKI_SOURCE_DIR" config user.email "rebuild@localhost"
+  fi
+
+  SERIES="${REPO_ROOT}/patches/sotoki/series"
+  PATCHES=()
+  if [[ -f "$SERIES" ]]; then
+    mapfile -t PATCHES < "$SERIES"
+  else
+    mapfile -t PATCHES < <(printf '%s\n' "${REPO_ROOT}"/patches/sotoki/*.patch)
+  fi
+  for p in "${PATCHES[@]}"; do
+    [[ -n "$p" ]] || continue
+    [[ -f "$p" ]] || p="${REPO_ROOT}/patches/sotoki/${p}"
+    [[ -f "$p" ]] || die "patch file not found: $p"
+    log "applying $(basename "$p")"
+    git -C "$SOTOKI_SOURCE_DIR" am --3way "$p" || die "git am failed on $p"
+  done
+
+  log "creating venv $SOTOKI_VENV and installing sotoki"
+  python3 -m venv "$SOTOKI_VENV"
+  "$SOTOKI_VENV/bin/pip" install -e "$SOTOKI_SOURCE_DIR"
+  log "sotoki patched and installed into $SOTOKI_VENV"
+else
+  log "sotoki source already patched ($SOTOKI_SOURCE_DIR); skipping clone/venv setup"
+fi
+
+log "bootstrap complete"

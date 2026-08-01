@@ -1,15 +1,16 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help config-check check-lock bootstrap restore-baseline update recover-images finalize-placeholders assemble verify
+.PHONY: help config-check check-lock bootstrap restore-baseline redis update recover-images finalize-placeholders assemble verify
 
 help: ## Print this help
 	@echo "stackoverflow-zim-rebuild targets:"
 	@echo "  help                  Show this help"
 	@echo "  config-check          Validate .env / WORK_ROOT configuration"
 	@echo "  check-lock            Verify sotoki.lock is complete and current"
-	@echo "  bootstrap             Clone + patch sotoki, prepare stage/redis"
-	@echo "  restore-baseline      Restore July 2026 baseline state"
+	@echo "  bootstrap             Tool checks, WORK_ROOT skeleton + restore marker, patched sotoki"
+	@echo "  restore-baseline      Restore July 2026 baseline bundle (set BASELINE_BUNDLE)"
+	@echo "  redis                 Manage the isolated redis instance (start|stop|status|restart)"
 	@echo "  update                Incremental update from fresh dump"
 	@echo "  recover-images        Recover missing images"
 	@echo "  finalize-placeholders Replace placeholder bytes"
@@ -23,10 +24,13 @@ check-lock:
 	@echo "check-lock: not yet implemented"
 
 bootstrap:
-	@echo "bootstrap: not yet implemented"
+	@bash bin/bootstrap
 
 restore-baseline:
-	@echo "restore-baseline: not yet implemented"
+	@bash bin/restore-baseline --bundle "${BASELINE_BUNDLE:?set BASELINE_BUNDLE}" $$ARGS
+
+redis:
+	@bash bin/redis ${ARGS}
 
 update:
 	@echo "update: not yet implemented"

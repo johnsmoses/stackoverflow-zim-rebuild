@@ -50,9 +50,67 @@ RECOVERY_ROOT="${RECOVERY_ROOT:-https://archive.org/download/stackoverflow-image
 
 ASSET_CACHE_DIR="${ASSET_CACHE_DIR:-${WORK_ROOT}/assets}"
 
+BASELINE_BUNDLE="${BASELINE_BUNDLE:-}"
+
 # --- helpers --------------------------------------------------------------
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Canonicalize a path without requiring it to exist (resolves symlinks and
+# normalizes .. / . components; "-m" is what makes non-existent paths safe).
+canonical_path() { realpath -m "$1"; }
+
+# Reject destinations that are empty, /, $HOME, or the repo root itself.
+reject_dangerous_path() {
+  local name="$1" p="$2"
+  [[ -n "$p" ]] || die "${name}: empty path rejected"
+  [[ "$p" != "/" ]] || die "${name}: '/' rejected as a destination"
+  [[ "$p" != "$(canonical_path "$HOME")" ]] || die "${name}: \$HOME rejected as a destination"
+  [[ "$p" != "$(canonical_path "${REPO_ROOT}")" ]] || die "${name}: repo root rejected as a destination"
+}
+
+# Reject a destination path that contains a symlink in any existing component.
+# realpath -m would silently resolve the symlink; the point is to refuse to
+# write through one at all.
+reject_symlinked_path() {
+  local name="$1" p="$2" cur="/" comp
+  [[ "$p" == /* ]] || p="${PWD}/${p}"
+  local IFS='/'
+  for comp in $p; do
+    [[ -n "$comp" ]] || continue
+    cur="${cur%/}/${comp}"
+    if [[ -L "$cur" ]]; then
+      unset IFS
+      die "${name}: path contains a symlink at '${cur}' (symlinked destinations are rejected)"
+    fi
+  done
+  unset IFS
+}
+
+# Serialize restore/redis operations with a non-blocking flock.
+acquire_restore_lock() {
+  local wr="$1"
+  mkdir -p "$wr"
+  exec 9>"${wr}/.restore.lock"
+  if ! flock -n 9; then
+    die "another restore/redis operation holds ${wr}/.restore.lock"
+  fi
+}
+
+# Full stage listing verification hash, as produced at bundle time:
+#   cd <bundle> && find stage -type f | sort | xargs sha256sum | sha256sum
+# This is a streaming, deterministic fingerprint of every stage file (path +
+# content). It is intentionally NOT part of MANIFEST.sha256 (see
+# docs/baseline-assets.md) because a 755GB stage makes an exhaustive
+# per-file checksum file impractical.
+compute_stage_listing_hash() {
+  local bundle="$1"
+  (
+    cd "$bundle" \
+      && find stage -type f -print0 | sort -z | xargs -0 -r sha256sum \
+      | sha256sum | awk '{print $1}'
+  )
+}
 
 # Reject empty/unset path variables
 require_path() {
@@ -67,7 +125,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-config-check}" in
     config-check)
       for v in WORK_ROOT STAGE_DIR OUTPUT_DIR TMP_DIR CACHE_DIR REDIS_DIR \
-               SOTOKI_SOURCE_DIR SOTOKI_VENV MIRROR_DIR ASSET_CACHE_DIR; do
+               SOTOKI_SOURCE_DIR SOTOKI_VENV MIRROR_DIR ASSET_CACHE_DIR \
+               BASELINE_BUNDLE; do
         require_path "$v" "${!v}"
       done
       log "config-check: OK (WORK_ROOT=${WORK_ROOT})"

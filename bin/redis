@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# redis — manage the isolated sotoki redis/valkey instance.
+#
+# The instance is private to this rebuild kit: it is bound to loopback only,
+# runs with a rendered config under $REDIS_DIR, and every operation is
+# serialized with flock on $WORK_ROOT/.restore.lock. Nothing here ever
+# touches a process it cannot prove it owns.
+#
+# usage: redis {start|stop|status|restart}
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+ACTION="${1:-}"
+case "$ACTION" in
+  start|stop|status|restart) ;;
+  *) echo "usage: redis {start|stop|status|restart}" >&2; exit 2 ;;
+esac
+
+WORK_ROOT="$(canonical_path "$WORK_ROOT")"
+REDIS_DIR="$(canonical_path "$REDIS_DIR")"
+
+# --- D2: REDIS_URL must be loopback only, port in 1-65535 ------------------
+parse_redis_url() {
+  local url="$1"
+  [[ "$url" == redis://* ]] || die "REDIS_URL must start with redis:// (got: '$url')"
+  local rest="${url#redis://}"
+  local hostport="${rest%%/*}"
+  local host="${hostport%%:*}"
+  local port="${hostport#*:}"
+  [[ "$port" != "$hostport" ]] || port=6379
+  case "$host" in
+    127.0.0.1|localhost) ;;
+    *) die "REDIS_URL must use loopback only (127.0.0.1 or localhost); got host '$host'" ;;
+  esac
+  [[ "$port" =~ ^[0-9]+$ ]] || die "REDIS_URL port is not numeric: '$port'"
+  if (( port < 1 || port > 65535 )); then
+    die "REDIS_URL port out of range 1-65535: $port"
+  fi
+  REDIS_PORT="$port"
+}
+parse_redis_url "$REDIS_URL"
+
+PIDFILE="${REDIS_DIR}/valkey.pid"
+CONF="${REDIS_DIR}/valkey.conf"
+PID=""
+
+read_pid() {
+  PID=""
+  [[ -f "$PIDFILE" ]] || return 1
+  local raw
+  raw="$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+  PID="$raw"
+}
+
+# Conclusive identity check (D2): the pid must exist, belong to the current
+# uid, and its cmdline must be a redis-server/valkey-server started with our
+# rendered config path, or (valkey 9 rewrites argv on daemonize) bound to our
+# loopback endpoint. Anything else is an unknown orphan and is never touched.
+verify_instance() {
+  local pid="$1" uid cmdline
+  [[ -n "$pid" ]] || return 1
+  [[ -d "/proc/$pid" ]] || return 1
+  uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ -n "$uid" && "$uid" == "$(id -u)" ]] || return 1
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  case "$cmdline" in
+    *redis-server*|*valkey-server*) ;;
+    *) return 1 ;;
+  esac
+  case "$cmdline" in
+    *"${CONF}"*|*"127.0.0.1:${REDIS_PORT}"*|*"localhost:${REDIS_PORT}"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# PID of the process currently listening on REDIS_PORT, if any (ss -ltnp).
+listening_pid() {
+  local line
+  line="$(ss -ltnp 2>/dev/null | grep -E "[0-9a-f.:]+:${REDIS_PORT}[[:space:]]" || true)"
+  [[ -n "$line" ]] || return 1
+  local pid
+  pid="$(printf '%s\n' "$line" | grep -oP 'pid=\K[0-9]+' | head -1)"
+  [[ -n "$pid" ]] && { printf '%s' "$pid"; return 0; }
+  return 1
+}
+
+ping_ok() {
+  redis-cli -h 127.0.0.1 -p "$REDIS_PORT" PING 2>/dev/null | grep -q PONG
+}
+
+render_config() {
+  mkdir -p "$REDIS_DIR"
+  sed -e "s|@REDIS_DIR@|${REDIS_DIR}|g" -e "s|@PORT@|${REDIS_PORT}|g" \
+    "${REPO_ROOT}/configs/valkey.conf.template" > "${CONF}"
+  chmod 600 "${CONF}"
+}
+
+wait_ping() {
+  local i
+  for i in $(seq 1 20); do
+    ping_ok && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+wait_exit() {
+  local pid="$1" i
+  for i in $(seq 1 20); do
+    [[ -d "/proc/$pid" ]] || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+start() {
+  render_config
+  if read_pid && verify_instance "$PID"; then
+    log "redis already running (pid $PID) on port ${REDIS_PORT}; nothing to do"
+    return 0
+  fi
+  local listener
+  if listener="$(listening_pid || true)" && [[ -n "$listener" ]]; then
+    if read_pid && [[ "$listener" == "$PID" ]] && verify_instance "$PID"; then
+      log "redis already running (pid $PID) on port ${REDIS_PORT}; nothing to do"
+      return 0
+    fi
+    die "port ${REDIS_PORT} in use by unrelated process (pid ${listener}); refusing to start"
+  fi
+  rm -f "$PIDFILE" # stale pidfile from an interrupted run
+  local srv=""
+  if command -v redis-server >/dev/null 2>&1; then
+    srv="$(command -v redis-server)"
+  elif command -v valkey-server >/dev/null 2>&1; then
+    srv="$(command -v valkey-server)"
+  else
+    die "neither redis-server nor valkey-server found in PATH"
+  fi
+  log "starting $srv with ${CONF}"
+  # Close fd 9 (the restore/redis flock) in the child before exec: a
+  # daemonized redis would otherwise inherit it and hold the lock forever.
+  (
+    exec 9>&-
+    "$srv" "$CONF"
+  ) || die "failed to start $srv with ${CONF}"
+  if ! wait_ping; then
+    log "ERROR: redis did not answer PING within 10s on port ${REDIS_PORT}"
+    cleanup_new_instance
+    return 1
+  fi
+  if read_pid && verify_instance "$PID"; then
+    log "redis started and verified (pid $PID, port ${REDIS_PORT})"
+  else
+    log "ERROR: post-start identity verification failed; stopping the new instance"
+    cleanup_new_instance
+    die "redis post-start verification failed; instance stopped"
+  fi
+}
+
+cleanup_new_instance() {
+  # We verified the port was free before starting, so any redis answering on
+  # it is the instance we just started: shut it down directly.
+  redis-cli -h 127.0.0.1 -p "$REDIS_PORT" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+  sleep 0.3
+  # Remove the pidfile only once the pid no longer exists.
+  if read_pid && [[ ! -d "/proc/$PID" ]]; then
+    rm -f "$PIDFILE"
+  fi
+}
+
+stop() {
+  if ! [[ -f "$PIDFILE" ]]; then
+    log "redis not running (no pidfile ${PIDFILE})"
+    return 0
+  fi
+  if ! read_pid; then
+    log "redis not running (invalid pidfile); removing stale pidfile"
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  if [[ ! -d "/proc/$PID" ]]; then
+    log "redis not running (pid $PID no longer exists); removing stale pidfile"
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  if ! verify_instance "$PID"; then
+    die "refusing to stop pid $PID on port ${REDIS_PORT}: identity check failed (uid/cmdline mismatch); not an owned redis instance"
+  fi
+  log "stopping owned redis instance pid $PID (SHUTDOWN NOSAVE)"
+  redis-cli -h 127.0.0.1 -p "$REDIS_PORT" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+  if ! wait_exit "$PID"; then
+    die "redis pid $PID did not exit within 10s after SHUTDOWN NOSAVE"
+  fi
+  # Remove the pidfile only once the pid no longer exists.
+  rm -f "$PIDFILE"
+  log "redis stopped"
+}
+
+status() {
+  if ! [[ -f "$PIDFILE" ]]; then
+    echo "redis: stopped (no pidfile ${PIDFILE})"
+    return 0
+  fi
+  if ! read_pid; then
+    echo "redis: stopped (stale/invalid pidfile ${PIDFILE})"
+    return 0
+  fi
+  if [[ ! -d "/proc/$PID" ]]; then
+    echo "redis: stopped (pid $PID no longer exists)"
+    return 0
+  fi
+  if verify_instance "$PID"; then
+    echo "redis: running (pid $PID, port ${REDIS_PORT}, identity verified)"
+    return 0
+  fi
+  echo "redis: pid $PID is running on port ${REDIS_PORT} but identity check FAILED (uid/cmdline mismatch); not touched"
+  return 1
+}
+
+restart() {
+  stop
+  start
+}
+
+# --- serialize all redis operations ----------------------------------------
+if [[ "${SOTOKI_RESTORE_LOCK_HELD:-0}" != "1" ]]; then
+  acquire_restore_lock "$WORK_ROOT"
+fi
+
+case "$ACTION" in
+  start)   start ;;
+  stop)    stop ;;
+  status)  status ;;
+  restart) restart ;;
+esac

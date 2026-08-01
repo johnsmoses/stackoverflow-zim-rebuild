@@ -1,0 +1,15 @@
+# valkey.conf.template — rendered by bin/redis to $REDIS_DIR/valkey.conf.
+# @REDIS_DIR@ and @PORT@ are substituted at render time. The instance is
+# private to this rebuild kit: loopback-only, no persistence triggers other
+# than the RDB loaded at startup (dbfilename sotoki.rdb, which is a copy of
+# the baseline RDB or the running build's saved state).
+port @PORT@
+dir @REDIS_DIR@
+dbfilename sotoki.rdb
+appendonly no
+save ""
+daemonize yes
+pidfile @REDIS_DIR@/valkey.pid
+logfile @REDIS_DIR@/valkey.log
+protected-mode yes
+bind 127.0.0.1

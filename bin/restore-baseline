@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# restore-baseline — restore the July 2026 baseline bundle into WORK_ROOT.
+#
+# Safeguards (see docs/baseline-assets.md):
+#  D1 delete safety  — canonicalize source/WORK_ROOT/destinations; reject
+#                      empty / $HOME / repo-root / symlinked / overlapping
+#                      paths; deletion is restricted to the fixed children
+#                      WORK_ROOT/stage (rsync --delete), WORK_ROOT/redis
+#                      (RDB replace) and WORK_ROOT/assets (copy only);
+#                      --replace requires $WORK_ROOT/.sotoki-rebuild-ok; all
+#                      operations are serialized with flock.
+#  D2 redis lifecycle — owned-instance identity checks live in bin/redis;
+#                      an owned instance is stopped before its RDB is
+#                      replaced, and restarted with the baseline RDB.
+#  D3 restore state  — manifest entries are validated (no absolute paths,
+#                      no '..', nothing escaping the bundle) before any
+#                      target is modified; the success marker is cleared at
+#                      restore start and recreated only after every check
+#                      passes.
+#  D4 stage checks   — MANIFEST.sha256 exhaustively covers the small
+#                      entries (MANIFEST.json, redis/, assets/, zim/); the
+#                      755GB stage/ is verified by default via the full
+#                      stage listing hash recorded in MANIFEST.json
+#                      (stage_listing_hash). --no-stage-verify is the
+#                      explicit opt-out; --strict-stage forces the listing
+#                      even in --validate-only mode. Sampling is never
+#                      sufficient.
+#
+# usage: restore-baseline --bundle <path> [--replace] [--validate-only]
+#                         [--no-redis] [--no-zim] [--no-stage-verify]
+#                         [--strict-stage]
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+BUNDLE=""
+REPLACE=0
+VALIDATE_ONLY=0
+NO_REDIS=0
+NO_ZIM=0
+NO_STAGE_VERIFY=0
+STRICT_STAGE=0
+
+usage() {
+  cat >&2 <<'EOF'
+usage: restore-baseline --bundle <path> [--replace] [--validate-only]
+                        [--no-redis] [--no-zim] [--no-stage-verify]
+                        [--strict-stage]
+
+  --bundle <path>     Baseline bundle directory (MANIFEST.json, MANIFEST.sha256,
+                      stage/, redis/baseline.rdb, assets/, optional zim/)
+  --replace           Replace an existing restored stage (rsync -a --delete on
+                      WORK_ROOT/stage only). REQUIRES WORK_ROOT/.sotoki-rebuild-ok.
+  --validate-only     Validate the bundle and checksums without touching targets;
+                      skips the slow stage listing unless --strict-stage.
+  --no-redis          Skip redis stop/start and redis verification.
+  --no-zim            Do not copy optional zim/*.zim from the bundle.
+  --no-stage-verify   EXPLICIT opt-out of the full stage listing verification.
+  --strict-stage      Force the full stage listing verification (even with
+                      --validate-only). Conflicts with --no-stage-verify.
+
+Environment: BASELINE_JSON overrides the baseline counts file used for
+snapshot verification (default: data/baseline-2026-07.json).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bundle) BUNDLE="${2:-}"; shift 2 ;;
+    --replace) REPLACE=1; shift ;;
+    --validate-only) VALIDATE_ONLY=1; shift ;;
+    --no-redis) NO_REDIS=1; shift ;;
+    --no-zim) NO_ZIM=1; shift ;;
+    --no-stage-verify) NO_STAGE_VERIFY=1; shift ;;
+    --strict-stage) STRICT_STAGE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+[[ -n "$BUNDLE" ]] || { echo "error: --bundle is required" >&2; usage; exit 2; }
+if [[ "$STRICT_STAGE" == 1 && "$NO_STAGE_VERIFY" == 1 ]]; then
+  die "--strict-stage and --no-stage-verify are mutually exclusive"
+fi
+
+# --- D1: canonicalize + reject bad destinations ----------------------------
+# Symlink rejection runs on the paths as given (realpath -m would silently
+# resolve the symlink and defeat the check).
+reject_symlinked_path WORK_ROOT "$WORK_ROOT"
+reject_symlinked_path STAGE_DIR "$STAGE_DIR"
+reject_symlinked_path REDIS_DIR "$REDIS_DIR"
+reject_symlinked_path ASSET_CACHE_DIR "$ASSET_CACHE_DIR"
+reject_symlinked_path OUTPUT_DIR "$OUTPUT_DIR"
+
+BUNDLE_C="$(canonical_path "$BUNDLE")"
+WORK_C="$(canonical_path "$WORK_ROOT")"
+STAGE_C="$(canonical_path "$STAGE_DIR")"
+REDIS_C="$(canonical_path "$REDIS_DIR")"
+ASSETS_C="$(canonical_path "$ASSET_CACHE_DIR")"
+OUT_C="$(canonical_path "$OUTPUT_DIR")"
+
+for p in "$BUNDLE_C" "$WORK_C" "$STAGE_C" "$REDIS_C" "$ASSETS_C" "$OUT_C"; do
+  reject_dangerous_path path "$p"
+done
+
+# Source-target overlap: no destination may equal the bundle, sit inside it,
+# or contain it.
+reject_overlap() {
+  local name="$1" d="$2" s="$3"
+  [[ "$d" != "$s" ]] || die "${name}: destination equals the source bundle"
+  case "$d" in
+    "$s"/*) die "${name}: destination is inside the source bundle ($d)" ;;
+  esac
+  case "$s" in
+    "$d"/*) die "${name}: source bundle is inside destination $d" ;;
+  esac
+}
+reject_overlap stage "$STAGE_C" "$BUNDLE_C"
+reject_overlap redis "$REDIS_C" "$BUNDLE_C"
+reject_overlap assets "$ASSETS_C" "$BUNDLE_C"
+reject_overlap output "$OUT_C" "$BUNDLE_C"
+
+# D1: deletion is restricted to the fixed WORK_ROOT children.
+[[ "$STAGE_C" == "$WORK_C/stage" ]] || die "STAGE_DIR must be the fixed child \$WORK_ROOT/stage (got $STAGE_C)"
+[[ "$REDIS_C" == "$WORK_C/redis" ]] || die "REDIS_DIR must be the fixed child \$WORK_ROOT/redis (got $REDIS_C)"
+[[ "$ASSETS_C" == "$WORK_C/assets" ]] || die "ASSET_CACHE_DIR must be the fixed child \$WORK_ROOT/assets (got $ASSETS_C)"
+
+MARKER="${WORK_C}/.sotoki-rebuild-ok"
+if [[ "$REPLACE" == 1 && "$VALIDATE_ONLY" == 0 ]]; then
+  [[ -f "$MARKER" ]] || die "refusing --replace: restore marker $MARKER is missing (bootstrap creates it only on an empty WORK_ROOT; otherwise it is written after a successful verified restore)"
+fi
+
+# --- serialize the whole restore -------------------------------------------
+acquire_restore_lock "$WORK_C"
+
+# --- bundle validation (fail fast) ------------------------------------------
+[[ -d "$BUNDLE_C" ]] || die "bundle directory not found: $BUNDLE_C"
+[[ -f "$BUNDLE_C/MANIFEST.json" ]] || die "bundle is missing MANIFEST.json"
+[[ -f "$BUNDLE_C/MANIFEST.sha256" ]] || die "bundle is missing MANIFEST.sha256"
+[[ -d "$BUNDLE_C/stage" ]] || die "bundle is missing stage/ directory"
+[[ -f "$BUNDLE_C/redis/baseline.rdb" ]] || die "bundle is missing redis/baseline.rdb"
+
+# --- D3: validate manifest entries before modifying anything ---------------
+python3 - "$BUNDLE_C/MANIFEST.json" "$BUNDLE_C" <<'PY' || die "manifest entry validation FAILED (see errors above)"
+import json
+import os
+import sys
+
+mf_path, bundle = sys.argv[1], os.path.realpath(sys.argv[2])
+try:
+    with open(mf_path) as fh:
+        mf = json.load(fh)
+except Exception as exc:  # noqa: BLE001
+    print(f"ERROR: cannot parse MANIFEST.json: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+entries = mf.get("entries")
+if entries is None:
+    entries = []
+if not isinstance(entries, list):
+    print("ERROR: MANIFEST.json 'entries' must be a list", file=sys.stderr)
+    sys.exit(1)
+
+bundle_prefix = bundle + os.sep
+bad = []
+for e in entries:
+    if not isinstance(e, str) or not e:
+        bad.append((repr(e), "not a non-empty string"))
+        continue
+    if e.startswith("/") or e.startswith("\\"):
+        bad.append((e, "absolute path"))
+        continue
+    parts = e.replace("\\", "/").split("/")
+    if any(p == ".." for p in parts):
+        bad.append((e, "contains '..'"))
+        continue
+    resolved = os.path.realpath(os.path.join(bundle, e))
+    if not resolved.startswith(bundle_prefix):
+        bad.append((e, "escapes the bundle directory"))
+if bad:
+    for e, why in bad:
+        print(f"ERROR: manifest entry {e}: {why}", file=sys.stderr)
+    sys.exit(1)
+print(f"manifest entries OK ({len(entries)} entries, all inside the bundle)")
+PY
+
+# --- D4: exhaustive checksums for the small entries --------------------------
+log "verifying MANIFEST.sha256 (covers MANIFEST.json, redis/, assets/, zim/)"
+( cd "$BUNDLE_C" && sha256sum -c MANIFEST.sha256 ) \
+  || die "checksum verification FAILED (MANIFEST.sha256)"
+
+# --- lightweight layout sanity (all modes) ----------------------------------
+verify_bundle_layout() {
+  python3 - "$BUNDLE_C/stage" <<'PY'
+import os
+import re
+import sys
+
+stage = sys.argv[1]
+html = os.path.join(stage, "html")
+images = os.path.join(stage, "images")
+errs = []
+if not os.path.isdir(html):
+    errs.append("stage/html missing")
+else:
+    try:
+        shards = [d for d in os.listdir(html) if os.path.isdir(os.path.join(html, d))]
+    except OSError as exc:
+        shards = []
+        errs.append(f"cannot read stage/html: {exc}")
+    hex_shards = [s for s in shards if re.fullmatch(r"[0-9a-f]{2}", s)]
+    if not hex_shards:
+        errs.append("stage/html has no 2-char hex shard dirs")
+    else:
+        found = 0
+        for s in sorted(hex_shards)[:3]:
+            sp = os.path.join(html, s)
+            try:
+                posts = sorted(os.listdir(sp))[:3]
+            except OSError:
+                posts = []
+            for p in posts:
+                if os.path.isfile(os.path.join(sp, p, "index.html")):
+                    found += 1
+        if found == 0:
+            errs.append("no sample index.html found under stage/html shards")
+if not os.path.isdir(images):
+    errs.append("stage/images missing")
+else:
+    try:
+        if not any(os.path.isfile(os.path.join(images, f)) for f in os.listdir(images)):
+            errs.append("stage/images has no files")
+    except OSError as exc:
+        errs.append(f"cannot read stage/images: {exc}")
+if errs:
+    for e in errs:
+        print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+print("bundle layout OK (html shards + sample index.html + images present)")
+PY
+}
+verify_bundle_layout
+
+# --- D4: full stage listing verification (default) --------------------------
+# Default: on. --no-stage-verify opts out explicitly. --validate-only skips
+# the slow listing unless --strict-stage is given.
+COMPUTE_LISTING=0
+if [[ "$NO_STAGE_VERIFY" == 0 && ( "$STRICT_STAGE" == 1 || "$VALIDATE_ONLY" == 0 ) ]]; then
+  COMPUTE_LISTING=1
+fi
+if [[ "$COMPUTE_LISTING" == 1 ]]; then
+  log "computing full stage listing hash (streaming; this is the default full stage verification; pass --no-stage-verify to skip it)"
+  local_hash="$(compute_stage_listing_hash "$BUNDLE_C")"
+  expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stage_listing_hash",""))' "$BUNDLE_C/MANIFEST.json")"
+  [[ -n "$expected" ]] || die "MANIFEST.json has no stage_listing_hash; cannot verify the stage (a sampling-only check is never acceptable)"
+  if [[ "$local_hash" != "$expected" ]]; then
+    die "stage listing hash mismatch: expected ${expected} got ${local_hash} (stage verification FAILED; --no-stage-verify is the explicit opt-out)"
+  fi
+  log "stage listing hash OK ($local_hash)"
+else
+  log "stage listing verification skipped (--no-stage-verify and/or --validate-only without --strict-stage)"
+fi
+
+if [[ "$VALIDATE_ONLY" == 1 ]]; then
+  echo
+  echo "VALIDATE-ONLY: bundle OK: $BUNDLE_C"
+  echo "No targets were modified; marker state unchanged."
+  exit 0
+fi
+
+# ============================== restore ====================================
+log "restore start: bundle=$BUNDLE_C work_root=$WORK_C"
+
+# Fresh (non-replace) restores require empty targets.
+if [[ "$REPLACE" == 0 ]]; then
+  for t in "$STAGE_C" "$ASSETS_C"; do
+    if [[ -d "$t" ]] && [[ -n "$(ls -A "$t" 2>/dev/null || true)" ]]; then
+      die "refusing non-empty target: $t (use --replace only with an existing restore marker)"
+    fi
+  done
+fi
+
+# D3: clear any prior success marker at restore start (i.e. once the restore
+# is committed to modifying targets; fail-fast rejections above leave the
+# marker intact). It is recreated only after every check below passes.
+rm -f "$MARKER"
+log "cleared prior restore marker $MARKER"
+
+# D3: stop an owned redis instance before replacing its RDB.
+if [[ "$NO_REDIS" == 0 && -d "$REDIS_C" ]]; then
+  log "stopping owned redis instance before RDB replace"
+  SOTOKI_RESTORE_LOCK_HELD=1 bash "${REPO_ROOT}/bin/redis" stop
+fi
+
+mkdir -p "$STAGE_C" "$ASSETS_C"
+
+# Stage copy — explicit rsync slash semantics. --delete is restricted to
+# WORK_ROOT/stage and only in --replace mode (marker was verified above).
+if [[ "$REPLACE" == 1 ]]; then
+  log "rsync -a --delete bundle/stage/ -> $STAGE_C (replace mode)"
+  rsync -a --delete "$BUNDLE_C/stage/" "$STAGE_C/" || die "stage rsync (replace) failed"
+else
+  log "rsync -a bundle/stage/ -> $STAGE_C"
+  rsync -a "$BUNDLE_C/stage/" "$STAGE_C/" || die "stage rsync failed"
+fi
+
+# Assets copy (merge, never --delete).
+log "rsync -a bundle/assets/ -> $ASSETS_C"
+rsync -a "$BUNDLE_C/assets/" "$ASSETS_C/" || die "assets rsync failed"
+
+# Optional zim delivery.
+if [[ "$NO_ZIM" == 0 && -d "$BUNDLE_C/zim" ]]; then
+  if find "$BUNDLE_C/zim" -maxdepth 1 -name '*.zim' -type f | grep -q .; then
+    mkdir -p "$OUT_C"
+    log "rsync -a bundle/zim/ -> $OUT_C"
+    rsync -a "$BUNDLE_C/zim/" "$OUT_C/" || die "zim rsync failed"
+  fi
+fi
+
+# Redis: baseline RDB + isolated instance.
+if [[ "$NO_REDIS" == 0 ]]; then
+  mkdir -p "$REDIS_C"
+  cp -f "$BUNDLE_C/redis/baseline.rdb" "$REDIS_C/sotoki.rdb"
+  log "baseline.rdb -> $REDIS_C/sotoki.rdb"
+  SOTOKI_RESTORE_LOCK_HELD=1 bash "${REPO_ROOT}/bin/redis" start
+fi
+
+# --- verification ------------------------------------------------------------
+BASELINE_JSON="${BASELINE_JSON:-${REPO_ROOT}/data/baseline-2026-07.json}"
+VERIFY_ARGS=(--stage "$STAGE_C" --redis-url "$REDIS_URL" --baseline "$BASELINE_JSON")
+if [[ "$NO_REDIS" == 1 ]]; then
+  VERIFY_ARGS+=(--skip-redis)
+fi
+log "verifying snapshot: scripts/verify_snapshot.py ${VERIFY_ARGS[*]}"
+python3 "${REPO_ROOT}/scripts/verify_snapshot.py" "${VERIFY_ARGS[@]}" \
+  || die "snapshot verification FAILED; restore marker was NOT written"
+
+# D3: marker only after everything passed.
+printf '%s\n' \
+  "restore marker: WORK_ROOT contains a verified restore of the July 2026 baseline bundle" \
+  "created by: bin/restore-baseline ($(date -u +%Y-%m-%dT%H:%M:%SZ))" \
+  "required for: --replace restores and future builds (make update and friends)" \
+  > "$MARKER"
+log "restore marker written: $MARKER"
+
+echo
+echo "RESTORE COMPLETE: $WORK_C"
+echo "  stage:  $STAGE_C"
+echo "  assets: $ASSETS_C"
+echo "  redis:  $REDIS_C (url $REDIS_URL)"
+echo "  marker: $MARKER"
+echo "The bundle was read-only; nothing under $BUNDLE_C was modified."
