@@ -175,7 +175,6 @@ jobs:
 
   worker-image:
     runs-on: ubuntu-latest
-    if: runner.os == 'Linux'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build worker image
