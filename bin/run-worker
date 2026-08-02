@@ -20,6 +20,7 @@
 #   bin/run-worker cdn --manifest /work/manifests/missing.tsv --limit 1000
 #   bin/run-worker ia --limit 10
 set -euo pipefail
+# shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 COMPOSE_FILE="${REPO_ROOT}/docker/image-worker/compose.yaml"

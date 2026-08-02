@@ -12,6 +12,7 @@
 #    openzim/sotoki, checks out 157ca9a, applies patches/sotoki/*.patch in
 #    series order, and installs it into SOTOKI_VENV.
 set -euo pipefail
+# shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 # --- 1. refuse root --------------------------------------------------------
@@ -85,7 +86,7 @@ log "WORK_ROOT skeleton ready: $WORK_ROOT"
 # --- 4. patched sotoki -----------------------------------------------------
 is_patched() {
   local d="$1" n
-  git -C "$d" rev-parse --verify --quiet 157ca9a^{commit} >/dev/null 2>&1 || return 1
+  git -C "$d" rev-parse --verify --quiet '157ca9a^{commit}' >/dev/null 2>&1 || return 1
   n="$(git -C "$d" rev-list --count 157ca9a..HEAD 2>/dev/null || echo 0)"
   [[ "$n" -ge 9 ]]
 }

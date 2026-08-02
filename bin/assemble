@@ -39,6 +39,7 @@
 # usage: bin/assemble [--snapshot-id X] [--flavour full|nopic]
 #                     [--skip-preflight] [--skip-zimcheck] [--out-name NAME]
 set -euo pipefail
+# shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 SNAPSHOT_ID="current"
@@ -158,6 +159,7 @@ fi
 # Remove the failed partial on any failure path; a prior good ZIM at FINAL is
 # never touched (promotion happens only after every gate passes).
 CLEANUP_PARTIAL=""
+# shellcheck disable=SC2317
 cleanup() {
   if [[ -n "$CLEANUP_PARTIAL" && -e "$CLEANUP_PARTIAL" ]]; then
     rm -f "$CLEANUP_PARTIAL" || true

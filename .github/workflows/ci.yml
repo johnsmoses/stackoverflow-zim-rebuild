@@ -56,11 +56,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Install gate dependencies
         run: |
-          # Python 3.12 resolves the last compatible zimscraperlib (5.0.0);
-          # everything here is needed only to import the patched sotoki.posts.
+          # Dependencies here are needed only to import the patched
+          # sotoki.posts for the tree-hash and incremental-render gates.
           python -m pip install --quiet pyyaml pytest \
             zimscraperlib kiwixstorage beautifulsoup4 mistune \
             python-slugify tld jinja2 jinja2-pluralize requests \

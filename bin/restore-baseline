@@ -30,6 +30,7 @@
 #                         [--no-redis] [--no-zim] [--no-stage-verify]
 #                         [--strict-stage]
 set -euo pipefail
+# shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 BUNDLE=""
