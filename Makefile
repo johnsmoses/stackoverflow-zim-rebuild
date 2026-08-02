@@ -11,9 +11,9 @@ help: ## Print this help
 	@echo "  bootstrap             Tool checks, WORK_ROOT skeleton + restore marker, patched sotoki"
 	@echo "  restore-baseline      Restore July 2026 baseline bundle (set BASELINE_BUNDLE)"
 	@echo "  redis                 Manage the isolated redis instance (start|stop|status|restart)"
-	@echo "  update                Incremental update from fresh dump"
-	@echo "  recover-images        Recover missing images"
-	@echo "  finalize-placeholders Replace placeholder bytes"
+	@echo "  update                Incremental update from fresh dump (patched sotoki --incremental; requires baseline + dump — see docs/update-runbook.md)"
+	@echo "  recover-images        Recover missing images (recovery/ pipeline, dry-run by default — see docs/recovery-runbook.md)"
+	@echo "  finalize-placeholders Replace verified placeholder bytes (recovery/finalize_unavailable.py)"
 	@echo "  assemble              Build ZIM"
 	@echo "  verify                zimcheck/zimdump + baseline comparison"
 

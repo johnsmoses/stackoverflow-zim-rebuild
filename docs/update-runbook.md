@@ -3,6 +3,13 @@
 How to update the Stack Overflow ZIM from a fresh StackExchange dump using
 the snapshot-aware incremental mode (sotoki patch commits 0006–0009).
 
+> **Invocation note (as implemented):** the `make update` target is a thin
+> placeholder and there is **no `bin/update` script** in this repository
+> yet (it may be a future addition). The implemented update flow is the
+> patched sotoki `--incremental` invocation documented in section 5 below,
+> run from the `SOTOKI_VENV` created by `make bootstrap`. The same
+> invocation is the documented behavior behind `make update`.
+
 ## 1. Immutable snapshot ID + archive provenance
 
 - Every incremental run requires `--snapshot-id <id>` (`^[A-Za-z0-9._-]+$`,
@@ -83,8 +90,8 @@ sotoki -d stackoverflow.com --mirror <mirror> --title "Stack Overflow" \
 
 > **Production prune policy:** before running `--prune-missing` against the
 > production staging tree, the prune plan (and the release policy for the
-> removed pages) requires **oracle review** — removal is irreversible
-> without re-extraction and re-rendering.
+> removed pages) requires **separate human review** — removal is
+> irreversible without re-extraction and re-rendering.
 
 ## 6. Assembly / verification flow
 

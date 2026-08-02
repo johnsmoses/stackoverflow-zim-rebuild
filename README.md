@@ -3,28 +3,39 @@
 Rebuild/update toolkit for the **StackOverflow ZIM archive** (Kiwix) from a
 fresh StackExchange XML dump, on top of a **patched sotoki**.
 
-## Purpose
+## What this is
 
 StackOverflow's full ZIM build depends on a specific patched version of
 [sotoki](https://github.com/openzim/sotoki) that was never merged upstream.
-This repository is the *rebuild kit*: it pins that exact source state, records
-the patches, and provides the scripts and reference baselines needed to
-reproduce or incrementally update the archive with **any new StackExchange
-dump** — without the original builder's private data.
+This repository is the *rebuild kit*: it pins that exact source state
+(upstream base `157ca9a` + a 9-patch series), records the patches, and
+provides the scripts and reference baselines needed to reproduce or
+incrementally update the archive with **any new StackExchange dump** —
+without the original builder's private data.
 
-Scope today: **Tasks 1–2 scaffolding**. Patch capture, build scripts, and
-recovery tooling are planned but not yet implemented (see the Makefile
-targets, which all print `not yet implemented`).
+The core flow is:
+
+`make bootstrap` → `make restore-baseline` → incremental `update` →
+`recover-images` → `finalize-placeholders` → `make assemble` → `make verify`
+
+Tasks 1–8 are implemented and tested (see [Status](#status) and
+[`CHANGELOG.md`](CHANGELOG.md)). For a fast, safe first run read
+[`docs/quickstart.md`](docs/quickstart.md) **before** starting any multi-day
+run, and run the fixture tests first (below).
 
 ## Reference artifacts
 
 The two published archives on archive.org are the ground truth for
-verification:
+verification. Sizes are the July 2026 upload records; the MD5 checksums
+below are likewise from the **July 2026 upload records** for these items.
 
-| Artifact | Size | Notes |
-|---|---|---|
-| `stackoverflow-final.zim` | 142 GB (152,103,236,002 bytes) | Full build with images |
-| `stackoverflow-nopic.zim` | 69 GB (73,421,904,273 bytes) | Build without images |
+| Artifact | Size | MD5 (July 2026 upload records) | Notes |
+|---|---|---|---|
+| `stackoverflow-final.zim` | 142 GB (152,103,236,002 bytes) | `5a2ba64aba5264df6722bfae1eb887b5` | Full build with images |
+| `stackoverflow-nopic.zim` | 69 GB (73,421,904,273 bytes) | `95beed5489d09793051b9f753d220d78` | Build without images |
+
+Items: `stackoverflow-final-zim` /
+`stackoverflow-nopic-zim` on archive.org.
 
 ## Baseline facts (July 2026 build)
 
@@ -45,53 +56,128 @@ equality (see [`docs/verification.md`](docs/verification.md)).
 ## The patched sotoki
 
 sotoki is pinned at upstream base commit `157ca9a` (see
-[`sotoki.lock`](sotoki.lock)). The working build used a patched copy from a
-site-packages install; the diff will be captured as a patch series in
-`patches/sotoki/` — **capture pending** (Task 3). See
-[`docs/patch-maintenance.md`](docs/patch-maintenance.md) for the policy.
+[`sotoki.lock`](sotoki.lock)). The working build used a patched copy captured
+from a site-packages install; the difference is recorded as a **9-patch
+series** in `patches/sotoki/`:
 
-## Build flow (planned)
+- **0001–0005** — the captured build patches (CLI options, staged rendering
+  with manifest checkpointing, assemble-only ZIM builder + title
+  sanitization, offline asset loading, bounded sort buffer + throttled
+  Redis flushes), parameterized so no machine-specific paths remain.
+- **0006–0009** — the **snapshot-aware incremental update mode**
+  (`--incremental --snapshot-id`, fingerprint + render contract, per-snapshot
+  build dirs, seen sets, opt-in hardened prune, local dump archives via
+  `--archive-dir`).
 
-1. `make bootstrap` — clone/patch sotoki, prepare stage + Redis
-2. `make restore-baseline` — restore July 2026 baseline state (optional)
-3. `make update` — incremental update from the fresh dump
-4. `make recover-images` — recover missing images (IA dump, CDN, scanners)
+See [`docs/patch-maintenance.md`](docs/patch-maintenance.md) for the policy
+and `patches/sotoki/README.md` for the per-patch detail.
+
+## Build flow
+
+1. `make bootstrap` — tool checks, WORK_ROOT skeleton + restore marker,
+   patched sotoki venv (`SOTOKI_VENV`)
+2. `make restore-baseline` — restore the July 2026 baseline bundle
+   (set `BASELINE_BUNDLE=...`); the bundle is produced externally, see
+   [`docs/baseline-assets.md`](docs/baseline-assets.md)
+3. `make update` — incremental update from a fresh dump (documented target
+   behavior; the implemented command sequence is the patched sotoki
+   `--incremental` invocation in
+   [`docs/update-runbook.md`](docs/update-runbook.md))
+4. `make recover-images` — recover missing images via the `recovery/`
+   pipeline (inventory → classify → IA manifest → XML scan → edge resolver →
+   sync; see [`docs/recovery-runbook.md`](docs/recovery-runbook.md))
 5. `make finalize-placeholders` — replace verified placeholder bytes
-6. `make assemble` — build the ZIM
+   (`recovery/finalize_unavailable.py`)
+6. `make assemble` — build the ZIM (`bin/assemble`, atomic promotion,
+   preflight + gates)
 7. `make verify` — zimcheck/zimdump + baseline comparison
+   ([`docs/verification.md`](docs/verification.md))
 
-## Storage requirements
+## Storage and time estimates
 
-Real runs need **many TB of free storage**: the July build's stage tree held
-~4.4M images plus the extracted dump, Redis held 55M keys, and the output ZIM
-is 142 GB (69 GB for nopic). Plan for:
+Reference figures from the July 2026 run:
 
-- stage (extracted XML + content): hundreds of GB to low TB
-- Redis RDB: tens of GB
-- assets/images cache: tens to hundreds of GB
-- output ZIMs: 69–142 GB each
+- Stage tree: **755 GB** (24.15M question pages + 4.37M staged images)
+- Redis: **55.25M keys** (db0, tens of GB RDB)
+- Outputs: **142 GB** (full) / **69 GB** (nopic)
+- Plan for **~1.5× the stage size** free on the WORK_ROOT filesystem
+  (≈1.1–1.2 TB for the July baseline; keep more headroom if you retain the
+  dump archive and both output ZIMs — see
+  [`docs/baseline-assets.md`](docs/baseline-assets.md))
+- Full (re-)render pass: **~2 days**; assemble-only: **~14 h**
+  (order-of-magnitude, hardware-dependent)
 
-The `.gitignore` keeps all of it out of git — **no data files, dumps, RDBs,
-images, or secrets are ever committed.**
+The `.gitignore` keeps all working data out of git — **no data files,
+dumps, RDBs, images, or secrets are ever committed.**
 
-## Quick start (scaffolding checks only)
+## Requirements
+
+- Python **3.12+**
+- `7z` or `7za` (dump extraction)
+- `git` (sotoki clone + patch application)
+- `redis-server` **or** `valkey-server` (isolated loopback instance via
+  `bin/redis`; Valkey is the tested default)
+- **~1.5 TB free** on the WORK_ROOT filesystem (see above)
+- `docker` + `docker compose` (optional — only for the image-recovery
+  workers, `docker/image-worker/`)
+- `zimcheck` / `zimdump` (optional — `audit_zim.py` degrades gracefully when
+  absent, see [`docs/verification.md`](docs/verification.md))
+
+## Quick start
 
 ```bash
-make help          # list targets
-make config-check  # validate .env / WORK_ROOT defaults (via bin/common.sh)
-cp .env.example .env   # only if you want to override defaults
-bash scripts/check_patch_series.sh --package-path . --base-commit 157ca9a --dry-run
-python scripts/capture_sotoki_patches.py --package-path . --dry-run
+git clone <this repo> && cd stackoverflow-zim-rebuild
+cp .env.example .env        # edit WORK_ROOT, DUMP_ARCHIVE, SNAPSHOT_ID
+make config-check           # validate .env / WORK_ROOT defaults
+make bootstrap              # tool checks + patched sotoki venv
+make restore-baseline BASELINE_BUNDLE=/path/to/bundle   # external bundle
+# ... update / recover-images / finalize-placeholders ...
+make assemble SNAPSHOT_ID=2027-01 FLAVOUR=full
+make verify ZIM=$WORK_ROOT/out/stackoverflow-2027-01-full.zim
 ```
+
+**Read [`docs/quickstart.md`](docs/quickstart.md) first** — it contains the
+step-by-step flow, the external artifacts table, and a **critical first-run
+warning**: the first incremental update over a legacy v1 stage re-renders
+*everything* once (v1 manifests carry no fingerprints). Before any real run,
+execute the fixture tests:
+
+```bash
+python3 -m pytest tests/recovery -q        # 37 offline recovery tests
+# + the docker image-worker smoke test (docs/nas-worker.md)
+```
+
+## Status
+
+| Task | State |
+|---|---|
+| 1–2: skeleton, provenance contract, patch scaffolding | done (`132e5c9`) |
+| 3: sotoki patch series captured (5 patches, base `157ca9a`) | done (`b884e5a`) |
+| 4: snapshot-aware incremental mode (patches 0006–0009) + fixture tests | done (`1fac3b4`) |
+| 5: baseline restore tooling | done (`2e9f531`) |
+| 6: image recovery pipeline + tests (37 offline tests) | done (`f7edcce`) |
+| 7: Docker image workers + NAS docs | done (`a446b6f`) |
+| 8: assembly verification tooling (`bin/assemble`, audit/compare scripts) | done (`4b9afcd`) |
+
+**Remaining (not yet implemented):** CI/release workflow (the existing
+`.github/workflows/ci.yml` is a smoke-test stub), and the legal/compliance
+review of publishing rebuilt ZIMs (see
+[`docs/data-and-license.md`](docs/data-and-license.md)).
 
 ## Layout
 
 ```
-bin/                 bash library (common.sh: env + helpers)
+bin/                 bash library + CLI wrappers (common.sh, bootstrap,
+                     restore-baseline, redis, assemble, run-worker)
 data/                reference baselines & specs (small, tracked)
-docs/                provenance, system design, configuration, maintenance
-patches/sotoki/      patch series (capture pending)
-scripts/             python/bash tooling (scaffolding today)
+docs/                quickstart, runbooks, design, configuration, verification
+patches/sotoki/      9-patch series (0001-0009) + series + README
+recovery/            image recovery pipeline (parameterized modules, dry-run
+                     by default) + recovery/README.md
+scripts/             python/bash tooling (capture, patch check, audit,
+                     compare, verify)
+docker/image-worker/ hardened container workers for image recovery
+configs/             expected-counts.json, valkey.conf.template
 requirements/        python dependency pins
 .github/workflows/   CI stub
 sotoki.lock          upstream + patch-series contract
