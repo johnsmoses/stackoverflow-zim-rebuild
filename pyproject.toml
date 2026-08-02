@@ -22,7 +22,7 @@ classifiers = [
 [project.optional-dependencies]
 dev = []
 
-# Metadata-only distribution for now: no importable packages yet.
-# The actual build/update logic lives in scripts/ (Task 4+).
+# Image recovery pipeline library (Task 6). The actual build/update logic
+# lives in scripts/ and the recovery/ package; see recovery/README.md.
 [tool.setuptools]
-packages = []
+packages = ["recovery", "recovery.lib"]
