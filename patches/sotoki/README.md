@@ -1,5 +1,16 @@
 # sotoki Patch Series
 
+> **License: GPL-3.0-only — NOT CC0.** This patch series is a derivative
+> work of [openzim/sotoki](https://github.com/openzim/sotoki) (GPL-3.0),
+> base commit `157ca9a1c73e3e6349f1c80bb03e058355aef743` (v3.0.2). The
+> patches are distributed under the **GNU General Public License, version 3
+> only** (the same terms as upstream sotoki); the full license text is in
+> [`LICENSES/GPL-3.0-only.txt`](../../LICENSES/GPL-3.0-only.txt). They are
+> **not** CC0: the repository-root `LICENSE` (CC0-1.0) covers only the
+> rebuild-kit tooling, not this directory. See
+> [`LICENSE.scope.md`](../../LICENSE.scope.md) and
+> [`NOTICE-ATTRIBUTION.md`](../../NOTICE-ATTRIBUTION.md).
+
 Maintainable 9-patch series reconstructing the July 2026 site-packages
 sotoki install from pristine upstream `157ca9a`, plus the snapshot-aware
 incremental update mode (Task 4).
@@ -30,6 +41,11 @@ functionally equivalent to the captured install (`capture/installed/`,
 checksums in `capture/MANIFEST.txt`). Patches 0006–0009 build on top and
 implement the snapshot-aware incremental update mode.
 
+**Series dates:** all nine patches were authored on 2026-08-01 (UTC
+capture 2026-08-01T22:03:15Z; patch `Date` headers Sat, 1 Aug 2026, local
+build time). 0001–0005 were captured from the July 2026 site-packages
+install; 0006–0009 were written on top for the incremental update mode.
+
 ## Parameterization edits (applied on top of the raw capture)
 
 The captured diffs contained machine-specific operational hacks. These were
@@ -58,7 +74,7 @@ parameterized in commit 0003/0005 so the series is portable:
 ## Incremental update mode (0006–0009)
 
 Four commits implementing the snapshot-aware incremental update mode
-(planner amendments A1–A6 + oracle prune hardenings H1–H5). Key concepts:
+(planner amendments A1–A6 + independent prune hardenings H1–H5). Key concepts:
 
 - **Snapshot model.** Each run carries an immutable `--snapshot-id`
   (`^[A-Za-z0-9._-]+$`). The per-question staging directory is
@@ -99,7 +115,7 @@ Four commits implementing the snapshot-aware incremental update mode
   `prune-plan-<snapshot>.jsonl` with fsync BEFORE any removal, then per-item
   results go to `prune-results-<snapshot>.jsonl`; on the first failure the
   remaining candidates are quarantined. Production prune policy requires
-  oracle review before use.
+  independent human review before use.
 - **User-card policy (A5).** Staged question user cards are HISTORICAL:
   `OwnerDisplayName` is in the fingerprint so name edits re-render, but
   reputation/badge changes do not trigger re-render. See

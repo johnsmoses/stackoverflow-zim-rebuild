@@ -14,8 +14,8 @@ patches are captured, ordered, applied, and validated.
 
 - Captured from the working **site-packages install** of sotoki
   (`.../site-packages/sotoki/`), diffed against the upstream checkout at
-  `157ca9a` (see `capture/README.md` and `capture/MANIFEST.txt` for
-  provenance, checksums, and per-file changed-line counts).
+  `157ca9a`. See `patches/sotoki/README.md` for the patch series
+  provenance; the raw capture evidence is retained locally, not published.
 - A **12-file allowlist** enforced by `scripts/capture_sotoki_patches.py`:
   `scraper.py`, `posts.py`, `utils/database/posts.py`, `utils/html.py`,
   `entrypoint.py`, `css.py`, `users.py`, `utils/database/redisdb.py`,

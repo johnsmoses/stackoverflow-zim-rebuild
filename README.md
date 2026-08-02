@@ -79,15 +79,20 @@ and `patches/sotoki/README.md` for the per-patch detail.
 2. `make restore-baseline` — restore the July 2026 baseline bundle
    (set `BASELINE_BUNDLE=...`); the bundle is produced externally, see
    [`docs/baseline-assets.md`](docs/baseline-assets.md)
-3. `make update` — incremental update from a fresh dump (documented target
-   behavior; the implemented command sequence is the patched sotoki
-   `--incremental` invocation in
-   [`docs/update-runbook.md`](docs/update-runbook.md))
-4. `make recover-images` — recover missing images via the `recovery/`
-   pipeline (inventory → classify → IA manifest → XML scan → edge resolver →
-   sync; see [`docs/recovery-runbook.md`](docs/recovery-runbook.md))
+3. `make update` — incremental update from a fresh dump. This target is a
+   guard: it fails fast until the operator supplies the prerequisites and
+   points at [`docs/update-runbook.md`](docs/update-runbook.md), which
+   documents the patched sotoki `--incremental --snapshot-id` command
+   sequence
+4. `make recover-images` — image recovery via the `recovery/` pipeline
+   (inventory → classify → IA manifest → XML scan → edge resolver → sync;
+   parameterized modules, dry-run by default). The make target is a guard
+   that fails fast and points at
+   [`docs/recovery-runbook.md`](docs/recovery-runbook.md)
 5. `make finalize-placeholders` — replace verified placeholder bytes
-   (`recovery/finalize_unavailable.py`)
+   (`recovery/finalize_unavailable.py`). The make target is a guard that
+   fails fast and points at
+   [`docs/recovery-runbook.md`](docs/recovery-runbook.md)
 6. `make assemble` — build the ZIM (`bin/assemble`, atomic promotion,
    preflight + gates)
 7. `make verify` — zimcheck/zimdump + baseline comparison
@@ -159,10 +164,15 @@ python3 -m pytest tests/recovery -q        # 37 offline recovery tests
 | 7: Docker image workers + NAS docs | done (`a446b6f`) |
 | 8: assembly verification tooling (`bin/assemble`, audit/compare scripts) | done (`4b9afcd`) |
 
-**Remaining (not yet implemented):** CI/release workflow (the existing
-`.github/workflows/ci.yml` is a smoke-test stub), and the legal/compliance
-review of publishing rebuilt ZIMs (see
-[`docs/data-and-license.md`](docs/data-and-license.md)).
+**Remaining (operational):** CI/release workflow is implemented (Task 10,
+commit `c4d100b` — see `.github/workflows/ci.yml` and
+`.github/workflows/release.yml`) and the legal/compliance documentation is
+done (Task 11 — see
+[`docs/data-and-license.md`](docs/data-and-license.md),
+[`LICENSE.scope.md`](LICENSE.scope.md), and
+[`NOTICE-ATTRIBUTION.md`](NOTICE-ATTRIBUTION.md)). What remains is
+operational: running CI on the hosted platform and creating the first
+tagged release (`release.yml` triggers on `v*` tags).
 
 ## Layout
 
@@ -179,12 +189,19 @@ scripts/             python/bash tooling (capture, patch check, audit,
 docker/image-worker/ hardened container workers for image recovery
 configs/             expected-counts.json, valkey.conf.template
 requirements/        python dependency pins
-.github/workflows/   CI stub
+.github/workflows/   CI (patch-apply gate, unit tests, config validation,
+                     doc links, worker image) + release workflow
 sotoki.lock          upstream + patch-series contract
 ```
 
 ## License
 
-This repository is **CC0-1.0** (see [`LICENSE`](LICENSE)). Note: sotoki
-itself is **GPL-3.0** and StackExchange content is **CC BY-SA 4.0**; see
+This is a **mixed-license repository**: tooling, docs, and data are
+**CC0-1.0** (see [`LICENSE`](LICENSE)), while `patches/sotoki/` is
+**GPL-3.0-only** — derived from [openzim/sotoki](https://github.com/openzim/sotoki)
+(GPL-3.0), full text in
+[`LICENSES/GPL-3.0-only.txt`](LICENSES/GPL-3.0-only.txt). See
+[`LICENSE.scope.md`](LICENSE.scope.md) for the per-directory scope and
+[`NOTICE-ATTRIBUTION.md`](NOTICE-ATTRIBUTION.md) for attribution. Note:
+StackExchange content is **CC BY-SA 4.0**; see
 [`docs/data-and-license.md`](docs/data-and-license.md) for the full picture.

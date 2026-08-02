@@ -73,7 +73,7 @@ field:
     BEFORE any removal; per-item results land in
     `prune-results-<snapshot>.jsonl`; on the first failure the remaining
     candidates are quarantined;
-  - production prune policy requires oracle review before use.
+  - production prune policy requires independent human review before use.
 - **User-card freshness.** Staged question user cards are HISTORICAL:
   `OwnerDisplayName` is fingerprinted so display-name edits re-render, but
   reputation/badge changes do not trigger re-render.
