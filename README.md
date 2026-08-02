@@ -5,8 +5,6 @@ fresh StackExchange XML dump, on top of a **patched sotoki**.
 
 ## What this is
 
-StackOverflow's full ZIM build depends on a specific patched version of
-[sotoki](https://github.com/openzim/sotoki) that was never merged upstream.
 This repository is the *rebuild kit*: it pins that exact source state
 (upstream base `157ca9a` + a 9-patch series), records the patches, and
 provides the scripts and reference baselines needed to reproduce or
