@@ -21,13 +21,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl file \
+    build-essential python3-dev pkg-config \
     libvips-dev libwebp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # pyvips is the preferred WebP converter; cwebp (libwebp-dev) is the fallback
 # used when pyvips is unavailable or fails for a payload. Both ship in the
-# image, so conversion never depends on the host.
-RUN pip install --no-cache-dir aiohttp aiosqlite pyvips
+# image, so conversion never depends on the host. pyvips 3.1.1 is pinned:
+# it matches the libvips 8.16 headers of the current python:3.12-slim base
+# (Debian trixie); the toolchain above covers source builds when no wheel
+# matches the interpreter.
+RUN pip install --no-cache-dir aiohttp aiosqlite pyvips==3.1.1
 
 # H1: non-root runtime user; /work is the only writable area (state/recovered
 # subdirs), everything else is read-only via compose.yaml (H4).
