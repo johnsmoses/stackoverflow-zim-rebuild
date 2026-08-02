@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# assemble — build a ZIM from the restored stage with atomic promotion.
+#
+# H2 atomic-assembly contract:
+#   * the partial ZIM lands in the FINAL output directory ($OUTPUT_DIR), so
+#     the promotion rename is a same-filesystem atomic mv;
+#   * a non-blocking flock on $OUTPUT_DIR/.assemble.lock serializes builds;
+#   * the partial name is unique ($OUT_NAME.partial.$$);
+#   * symlinked or non-regular output paths are rejected (test -L / -f on
+#     the resolved output path);
+#   * ALL structural checks (audit_zim.py, which runs zimcheck when the
+#     binary is available) AND compare_baseline.py run BEFORE promotion;
+#   * promotion is a single atomic mv, only after every gate passes;
+#   * on failure the failed partial is removed while any prior good ZIM is
+#     preserved untouched;
+#   * the run manifest is written atomically (temp + rename) and records
+#     the final ZIM sha256, size, tool versions, args and gate results.
+#
+# H5: no temp/output file is ever placed inside the stage directory — every
+# temporary artifact lives under TMP_DIR or OUTPUT_DIR.
+#
+# Preconditions: WORK_ROOT must be set, STAGE_DIR must contain question
+# pages, and $WORK_ROOT/.sotoki-rebuild-ok must exist (a verified baseline
+# restore) — otherwise the build refuses with "baseline not restored".
+#
+# PREFLIGHT (skip with --skip-preflight):
+#   * stage question page count > 0
+#   * redis reachable (bin/redis status reports a running instance)
+#   * verify_snapshot.py passes (--require-redis)
+#   * free space on OUTPUT_DIR >= 1.5x the expected output size
+#
+# The sotoki command shape is canonical:
+#   full:  sotoki --assemble-only --stage-dir $STAGE_DIR --keep --keep-redis
+#   nopic: ... + --without-images
+# Operators may pass additional flags (e.g. -d / --mirror / --title) via the
+# SOTOKI_EXTRA_ARGS environment variable; they are inserted before the
+# canonical args so the canonical flags still take precedence.
+#
+# usage: bin/assemble [--snapshot-id X] [--flavour full|nopic]
+#                     [--skip-preflight] [--skip-zimcheck] [--out-name NAME]
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+SNAPSHOT_ID="current"
+FLAVOUR="full"
+SKIP_PREFLIGHT=0
+SKIP_ZIMCHECK=0
+OUT_NAME=""
+
+usage() {
+  cat >&2 <<'EOF'
+usage: bin/assemble [--snapshot-id X] [--flavour full|nopic]
+                    [--skip-preflight] [--skip-zimcheck] [--out-name NAME]
+
+  --snapshot-id X    snapshot identifier used in the output name
+                     (default: "current"); output names are
+                     stackoverflow-<id>-full.zim / -nopic.zim
+  --flavour full|nopic   full includes staged images; nopic adds
+                     --without-images (default: full)
+  --skip-preflight   skip stage-count/redis/verify_snapshot/free-space checks
+  --skip-zimcheck    skip running the external zimcheck binary (audit_zim.py
+                     still runs its own checks)
+  --out-name NAME    explicit output name (default derived from snapshot/flavour)
+
+Environment: BASELINE_JSON (default data/baseline-2026-07.json),
+ZIMCHECK_BIN (path to zimcheck), SOTOKI_EXTRA_ARGS (extra sotoki flags).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --snapshot-id) SNAPSHOT_ID="${2:-}"; shift 2 ;;
+    --flavour) FLAVOUR="${2:-}"; shift 2 ;;
+    --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+    --skip-zimcheck) SKIP_ZIMCHECK=1; shift ;;
+    --out-name) OUT_NAME="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+case "$FLAVOUR" in
+  full|nopic) ;;
+  *) die "invalid --flavour '$FLAVOUR' (expected full or nopic)" ;;
+esac
+[[ -n "$SNAPSHOT_ID" ]] || die "--snapshot-id is empty"
+
+# --- mandatory preconditions ------------------------------------------------
+require_path WORK_ROOT "$WORK_ROOT"
+WORK_ROOT="$(canonical_path "$WORK_ROOT")"
+STAGE_DIR="$(canonical_path "$STAGE_DIR")"
+OUTPUT_DIR="$(canonical_path "$OUTPUT_DIR")"
+TMP_DIR="$(canonical_path "$TMP_DIR")"
+SOTOKI_SOURCE_DIR="$(canonical_path "$SOTOKI_SOURCE_DIR")"
+SOTOKI_VENV="$(canonical_path "$SOTOKI_VENV")"
+reject_dangerous_path STAGE_DIR "$STAGE_DIR"
+reject_symlinked_path STAGE_DIR "$STAGE_DIR"
+reject_dangerous_path OUTPUT_DIR "$OUTPUT_DIR"
+reject_symlinked_path OUTPUT_DIR "$OUTPUT_DIR"
+
+[[ -d "$STAGE_DIR" ]] || die "STAGE_DIR ($STAGE_DIR) does not exist"
+[[ -f "$WORK_ROOT/.sotoki-rebuild-ok" ]] \
+  || die "baseline not restored: $WORK_ROOT/.sotoki-rebuild-ok is missing (run bootstrap + restore-baseline first)"
+
+count_question_dirs() {
+  local html="$1" total=0 shard post
+  [[ -d "$html" ]] || { echo 0; return; }
+  for shard in "$html"/*/; do
+    [[ -d "$shard" ]] || continue
+    for post in "$shard"*/; do
+      [[ -d "$post" ]] && total=$((total + 1))
+    done
+  done
+  echo "$total"
+}
+
+count_images() {
+  local root="$1" total=0
+  [[ -d "$root" ]] || { echo 0; return; }
+  while IFS= read -r -d '' _; do total=$((total + 1)); done < <(find "$root" -type f -print0 2>/dev/null)
+  echo "$total"
+}
+
+STAGE_QUESTION_COUNT="$(count_question_dirs "$STAGE_DIR/html")"
+if [[ "$STAGE_QUESTION_COUNT" -eq 0 ]]; then
+  die "STAGE_DIR ($STAGE_DIR) contains no question pages (count=0)"
+fi
+log "stage question pages: $STAGE_QUESTION_COUNT"
+
+BASELINE_JSON="${BASELINE_JSON:-${REPO_ROOT}/data/baseline-2026-07.json}"
+[[ -f "$BASELINE_JSON" ]] || die "baseline file not found: $BASELINE_JSON"
+
+# --- output names + path rejection (H2) -------------------------------------
+if [[ -z "$OUT_NAME" ]]; then
+  OUT_NAME="stackoverflow-${SNAPSHOT_ID}-${FLAVOUR}.zim"
+fi
+FINAL="${OUTPUT_DIR}/${OUT_NAME}"
+PARTIAL="${OUTPUT_DIR}/${OUT_NAME}.partial.$$"
+
+if [[ -L "$FINAL" ]]; then
+  die "output path $FINAL is a symlink — symlinked output paths are rejected"
+fi
+if [[ -e "$FINAL" && ! -f "$FINAL" ]]; then
+  die "output path $FINAL exists but is not a regular file"
+fi
+if [[ -e "$PARTIAL" ]]; then
+  die "partial path $PARTIAL already exists (stale partial from a previous run?)"
+fi
+
+mkdir -p "$OUTPUT_DIR" "$TMP_DIR"
+
+# Non-blocking lock: exactly one assemble may run at a time.
+exec 8>"${OUTPUT_DIR}/.assemble.lock"
+if ! flock -n 8; then
+  die "another assemble holds ${OUTPUT_DIR}/.assemble.lock"
+fi
+
+# Remove the failed partial on any failure path; a prior good ZIM at FINAL is
+# never touched (promotion happens only after every gate passes).
+CLEANUP_PARTIAL=""
+cleanup() {
+  if [[ -n "$CLEANUP_PARTIAL" && -e "$CLEANUP_PARTIAL" ]]; then
+    rm -f "$CLEANUP_PARTIAL" || true
+    log "removed failed partial $CLEANUP_PARTIAL (prior good ZIM untouched)"
+  fi
+}
+trap cleanup EXIT
+
+# --- preflight ----------------------------------------------------------------
+if [[ "$SKIP_PREFLIGHT" == 1 ]]; then
+  log "preflight skipped (--skip-preflight)"
+else
+  EXPECTED_BYTES="$(python3 - "$REPO_ROOT" "$FLAVOUR" <<'PY'
+import json, sys
+root, flavour = sys.argv[1], sys.argv[2]
+with open(f"{root}/configs/expected-counts.json", encoding="utf-8") as fh:
+    cfg = json.load(fh)
+key = "nopic_zim_bytes" if flavour == "nopic" else "full_zim_bytes"
+print(int(cfg.get(key, 0)))
+PY
+)"
+  [[ "$EXPECTED_BYTES" -gt 0 ]] || die "cannot determine expected output size from configs/expected-counts.json"
+
+  log "preflight: stage question pages = $STAGE_QUESTION_COUNT (> 0)"
+
+  status_out="$(bash "$REPO_ROOT/bin/redis" status 2>&1 || true)"
+  if [[ "$status_out" != *"redis: running"* ]]; then
+    die "preflight: redis is not running — $(printf '%s' "$status_out" | tr '\n' ' ')"
+  fi
+  log "preflight: redis running"
+
+  python3 "$REPO_ROOT/scripts/verify_snapshot.py" \
+    --stage "$STAGE_DIR" --baseline "$BASELINE_JSON" --require-redis \
+    >&2 || die "preflight: verify_snapshot.py failed"
+  log "preflight: verify_snapshot.py passed"
+
+  required_kb=$(( (EXPECTED_BYTES * 3 / 2 + 1023) / 1024 ))
+  df_line="$(df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4, $6}')"
+  avail_kb="${df_line%% *}"
+  df_mnt="${df_line##* }"
+  if (( avail_kb < required_kb )); then
+    die "preflight: free space on $df_mnt is ${avail_kb}KB; need >= ${required_kb}KB (1.5x expected ${EXPECTED_BYTES} bytes)"
+  fi
+  log "preflight: free space OK on $df_mnt (${avail_kb}KB avail >= ${required_kb}KB needed)"
+fi
+
+# --- resolve patched sotoki ----------------------------------------------------
+SOTOKI=""
+for cand in \
+  "$SOTOKI_VENV/bin/sotoki" \
+  "${SOTOKI_SOURCE_DIR}/.venv/bin/sotoki" \
+  "${SOTOKI_SOURCE_DIR}/venv/bin/sotoki"; do
+  if [[ -x "$cand" ]]; then
+    SOTOKI="$cand"
+    break
+  fi
+done
+if [[ -z "$SOTOKI" ]]; then
+  die "patched sotoki not found (looked in \$SOTOKI_VENV/bin/sotoki and venvs under \$SOTOKI_SOURCE_DIR)"
+fi
+if ! "$SOTOKI" --help 2>&1 | grep -q -- '--assemble-only'; then
+  die "sotoki at $SOTOKI is not the patched build (--assemble-only missing from --help)"
+fi
+log "using sotoki: $SOTOKI"
+
+# --- build ----------------------------------------------------------------------
+START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+log "starting $FLAVOUR assembly (snapshot $SNAPSHOT_ID) -> $FINAL"
+mapfile -t ZIMS_BEFORE < <(find "$TMP_DIR" -maxdepth 4 -type f -name '*.zim' 2>/dev/null | sort)
+
+SOTOKI_ARGS=(
+  --assemble-only
+  --stage-dir "$STAGE_DIR"
+  --keep
+  --keep-redis
+  --tmp-dir "$TMP_DIR"
+  --threads "$THREADS"
+  --content-threads "$CONTENT_THREADS"
+)
+if [[ "$FLAVOUR" == "nopic" ]]; then
+  SOTOKI_ARGS+=(--without-images)
+fi
+# shellcheck disable=SC2206
+EXTRA_ARGS=( ${SOTOKI_EXTRA_ARGS:-} )
+
+log "running: $SOTOKI ${EXTRA_ARGS[*]} ${SOTOKI_ARGS[*]}"
+"$SOTOKI" "${EXTRA_ARGS[@]}" "${SOTOKI_ARGS[@]}"
+log "sotoki exited 0"
+
+# Locate the produced ZIM (sotoki writes into its --tmp-dir build dir).
+mapfile -t ZIMS_AFTER < <(find "$TMP_DIR" -maxdepth 4 -type f -name '*.zim' 2>/dev/null | sort)
+NEW_ZIMS=()
+for z in "${ZIMS_AFTER[@]}"; do
+  seen=0
+  for b in "${ZIMS_BEFORE[@]}"; do
+    [[ "$z" == "$b" ]] && seen=1 && break
+  done
+  [[ "$seen" == 0 ]] && NEW_ZIMS+=("$z")
+done
+if [[ "${#NEW_ZIMS[@]}" -ne 1 ]]; then
+  die "expected exactly one new .zim under TMP_DIR after assembly, found ${#NEW_ZIMS[@]}: ${NEW_ZIMS[*]:-none}"
+fi
+PRODUCED="${NEW_ZIMS[0]}"
+mv "$PRODUCED" "$PARTIAL"
+CLEANUP_PARTIAL="$PARTIAL"
+log "partial staged at $PARTIAL ($(du -h "$PARTIAL" | cut -f1))"
+
+# --- gates: structural checks + baseline comparison (ALL before promotion) ----
+GATE_LOG="${TMP_DIR}/assemble-gates.$$.txt"
+: > "$GATE_LOG"
+
+gate_run() {
+  local name="$1" report_path="$2"
+  shift 2
+  log "gate: $name"
+  local out rc
+  set +e
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    printf '%s\tpass\t%s\n' "$name" "$report_path" >> "$GATE_LOG"
+    log "gate $name: PASS"
+  else
+    printf '%s\tfail\t%s\n' "$name" "$report_path" >> "$GATE_LOG"
+    log "gate $name: FAIL (exit $rc)"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+}
+
+AUDIT_OUT="${OUTPUT_DIR}/.${OUT_NAME}.audit-zim.$$.json"
+COMPARE_OUT="${OUTPUT_DIR}/.${OUT_NAME}.compare-baseline.$$.json"
+
+ZIMCHECK_ARGS=()
+if [[ "$SKIP_ZIMCHECK" == 1 ]]; then
+  ZIMCHECK_ARGS+=(--no-zimcheck)
+elif [[ -n "${ZIMCHECK_BIN:-}" ]]; then
+  ZIMCHECK_ARGS+=(--zimcheck-bin "$ZIMCHECK_BIN")
+fi
+
+gate_run audit_zim "$AUDIT_OUT" python3 "$REPO_ROOT/scripts/audit_zim.py" \
+  --zim "$PARTIAL" --baseline "$BASELINE_JSON" --out "$AUDIT_OUT" "${ZIMCHECK_ARGS[@]}"
+gate_run compare_baseline "$COMPARE_OUT" python3 "$REPO_ROOT/scripts/compare_baseline.py" \
+  --zim "$PARTIAL" --stage-dir "$STAGE_DIR" --baseline "$BASELINE_JSON" --out "$COMPARE_OUT"
+
+# --- atomic promotion + manifest -------------------------------------------------
+END_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+log "all gates passed; promoting $PARTIAL -> $FINAL"
+mv "$PARTIAL" "$FINAL"
+CLEANUP_PARTIAL=""
+FINAL_SIZE="$(stat -c %s "$FINAL")"
+FINAL_SHA256="$(sha256sum "$FINAL" | awk '{print $1}')"
+STAGE_IMAGE_COUNT="$(count_images "$STAGE_DIR/images")"
+
+SOTOKI_COMMIT=""
+if [[ -d "$SOTOKI_SOURCE_DIR/.git" ]]; then
+  SOTOKI_COMMIT="$(git -C "$SOTOKI_SOURCE_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+fi
+PYTHON_VERSION="$(python3 --version 2>&1 | awk '{print $2}')"
+
+MANIFEST_JSON="${OUTPUT_DIR}/${OUT_NAME}.manifest.json"
+MANIFEST_TMP="${OUTPUT_DIR}/.${OUT_NAME}.manifest.json.tmp.$$"
+SOTOKI_ARGS_FILE="${TMP_DIR}/assemble-sotoki-args.$$.txt"
+printf '%s\n' "${SOTOKI_ARGS[@]}" > "$SOTOKI_ARGS_FILE"
+
+export OUT_NAME SNAPSHOT_ID FLAVOUR START_UTC END_UTC BASELINE_JSON GATE_LOG
+SOTOKI_EXTRA_ARGS_ENV="${SOTOKI_EXTRA_ARGS:-}"
+export SOTOKI SOTOKI_COMMIT PYTHON_VERSION STAGE_QUESTION_COUNT STAGE_IMAGE_COUNT
+export STAGE_DIR FINAL FINAL_SIZE FINAL_SHA256 SOTOKI_EXTRA_ARGS_ENV
+python3 - "$MANIFEST_TMP" "$SOTOKI_ARGS_FILE" <<'PY'
+import json, os, sys
+
+out_path, args_file = sys.argv[1], sys.argv[2]
+with open(args_file, encoding="utf-8") as fh:
+    sotoki_args = [line.rstrip("\n") for line in fh if line.strip()]
+manifest = {
+    "tool": "bin/assemble",
+    "out_name": os.environ["OUT_NAME"],
+    "snapshot_id": os.environ["SNAPSHOT_ID"],
+    "flavour": os.environ["FLAVOUR"],
+    "started_at": os.environ["START_UTC"],
+    "finished_at": os.environ["END_UTC"],
+    "baseline": os.environ["BASELINE_JSON"],
+    "args": {
+        "sotoki": os.environ["SOTOKI"],
+        "sotoki_args": sotoki_args,
+        "extra_args": os.environ.get("SOTOKI_EXTRA_ARGS_ENV", "") or [],
+    },
+    "tool_versions": {
+        "sotoki_commit": os.environ.get("SOTOKI_COMMIT", ""),
+        "python": os.environ.get("PYTHON_VERSION", ""),
+    },
+    "input_stage": {
+        "question_pages": int(os.environ["STAGE_QUESTION_COUNT"]),
+        "images": int(os.environ["STAGE_IMAGE_COUNT"]),
+        "stage_dir": os.environ["STAGE_DIR"],
+    },
+    "output": {
+        "path": os.environ["FINAL"],
+        "bytes": int(os.environ["FINAL_SIZE"]),
+        "sha256": os.environ["FINAL_SHA256"],
+    },
+    "gates": {},
+}
+with open(os.environ["GATE_LOG"], encoding="utf-8") as fh:
+    for line in fh:
+        name, status, report_path = line.rstrip("\n").split("\t")
+        manifest["gates"][name] = {
+            "status": status,
+            "report": report_path if os.path.isfile(report_path) else None,
+        }
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(manifest, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+rm -f "$SOTOKI_ARGS_FILE"
+mv "$MANIFEST_TMP" "$MANIFEST_JSON"
+
+log "assemble complete: $FINAL (${FINAL_SIZE} bytes, sha256 $FINAL_SHA256)"
+log "run manifest: $MANIFEST_JSON"
+exit 0

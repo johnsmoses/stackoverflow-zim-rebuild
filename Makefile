@@ -42,7 +42,9 @@ finalize-placeholders:
 	@echo "finalize-placeholders: not yet implemented"
 
 assemble:
-	@echo "assemble: not yet implemented"
+	@bash bin/assemble --snapshot-id "${SNAPSHOT_ID:-current}" --flavour "${FLAVOUR:-full}" $$ARGS
 
 verify:
-	@echo "verify: not yet implemented"
+	@scripts/audit_stage.py --stage-dir $${STAGE_DIR:?set STAGE_DIR} --placeholder-spec data/placeholder-spec.json \
+		&& scripts/audit_zim.py --zim $${ZIM:?set ZIM} \
+		&& scripts/compare_baseline.py --zim $${ZIM} --baseline data/baseline-2026-07.json

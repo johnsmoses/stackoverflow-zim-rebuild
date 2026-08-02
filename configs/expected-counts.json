@@ -1,0 +1,15 @@
+{
+  "questions": 24152540,
+  "staged_images": 4375716,
+  "zim_entries": 85441337,
+  "redis_db0_keys": 55250097,
+  "initial_placeholders": 521489,
+  "recovered": 410856,
+  "unrecoverable": 120633,
+  "full_zim_bytes": 152103236002,
+  "nopic_zim_bytes": 73421904273,
+  "tolerance": 0.02,
+  "large_delta_pct": 50,
+  "min_question_pages": 1000,
+  "min_zim_entries": 1000000
+}
