@@ -181,5 +181,7 @@ jobs:
         run: docker build -t image-worker:ci docker/image-worker
       - name: "Import smoke test (H1: --network none)"
         run: |
+          # ENTRYPOINT is python3, so the -c script is passed directly
+          # (a bare `python3` here would exec python3 python3 ...).
           docker run --network none --rm image-worker:ci \
-            python3 -c "import recover_convert_images; import ia_sstatic_basename_recovery; print('import smoke OK')"
+            -c "import recover_convert_images; import ia_sstatic_basename_recovery; print('import smoke OK')"
