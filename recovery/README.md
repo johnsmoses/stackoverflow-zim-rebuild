@@ -175,7 +175,7 @@ manifests are reproducible with zero sockets.
 - **Live CDN** — `https://i.sstatic.net/<filename>` (and the
   `i.stack.imgur.com` variants found in the dump).
 - **Optional acceleration** — NAS / WireGuard workers (see
-  `docs/nas-worker.md`, planned); nothing in this repo references any
+  `docs/nas-worker.md`); nothing in this repo references any
   private host.
 
 ## Tests
