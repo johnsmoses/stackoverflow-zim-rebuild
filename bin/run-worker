@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# run-worker — run a Docker image-recovery worker via compose.
+#
+# usage: bin/run-worker {cdn|ia} [worker args...]
+#
+#   cdn   docker compose -f docker/image-worker/compose.yaml run --rm \
+#           so-image-worker recover_convert_images.py "$@"
+#   ia    docker compose -f docker/image-worker/compose.yaml run --rm \
+#           so-ia-basename ia_sstatic_basename_recovery.py "$@"
+#
+# Container-path defaults are inserted for --manifest / --state-dir /
+# --out-dir (and --ia-dir for ia) when they are not given. The container
+# paths are fixed by compose.yaml: host dirs from docker/image-worker/.env
+# (MANIFEST_DIR, IA_SHARDS_DIR, STATE_DIR, RECOVERED_DIR) are mounted at
+# /work/manifests, /work/ia-shards, /work/state, /work/recovered
+# respectively. See docker/image-worker/README.md and docs/nas-worker.md.
+#
+# examples:
+#   bin/run-worker cdn --limit 10
+#   bin/run-worker cdn --manifest /work/manifests/missing.tsv --limit 1000
+#   bin/run-worker ia --limit 10
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+COMPOSE_FILE="${REPO_ROOT}/docker/image-worker/compose.yaml"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: bin/run-worker {cdn|ia} [worker args...]
+
+  cdn   run the live-CDN downloader (so-image-worker)
+  ia    run the Archive.org ZIP shard extractor (so-ia-basename)
+
+Worker args are passed through; defaults are applied for
+--manifest/--state-dir/--out-dir (and --ia-dir for ia) when absent.
+EOF
+}
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+MODE="$1"; shift
+
+case "$MODE" in
+  cdn) SERVICE="so-image-worker"; SCRIPT="recover_convert_images.py" ;;
+  ia)  SERVICE="so-ia-basename"; SCRIPT="ia_sstatic_basename_recovery.py" ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) echo "error: unknown worker mode: $MODE" >&2; usage; exit 2 ;;
+esac
+
+# --- docker availability -----------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+  die "docker is required but was not found in PATH (install docker and retry)"
+fi
+if ! docker info >/dev/null 2>&1; then
+  die "docker daemon is not reachable (is the daemon running?)"
+fi
+[[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
+
+# --- build the worker args, filling in /work defaults when absent ------------
+ARGS=()
+have_flag() { # flag  args...
+  local flag="$1"; shift
+  local a
+  for a in "$@"; do
+    [[ "$a" == "$flag" || "$a" == "$flag="* ]] && return 0
+  done
+  return 1
+}
+append_default() { # flag value  args...
+  local flag="$1" value="$2"; shift 2
+  if ! have_flag "$flag" "$@"; then
+    ARGS+=("$flag" "$value")
+  fi
+}
+
+append_default --manifest "/work/manifests/missing_image_url_map.tsv" "$@"
+append_default --state-dir "/work/state" "$@"
+append_default --out-dir "/work/recovered" "$@"
+if [[ "$MODE" == "ia" ]]; then
+  append_default --ia-dir "/work/ia-shards" "$@"
+fi
+ARGS+=("$@")
+
+# --- run ---------------------------------------------------------------------
+log "running ${SERVICE} (${SCRIPT}) via compose"
+docker compose -f "$COMPOSE_FILE" run --rm "$SERVICE" "$SCRIPT" "${ARGS[@]}"

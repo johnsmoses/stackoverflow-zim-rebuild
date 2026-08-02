@@ -1,0 +1,77 @@
+# Image worker containers (Task 7).
+#
+# Two run-once worker services on the same hardened image:
+#   so-image-worker    live-CDN downloader (recover_convert_images.py)
+#   so-ia-basename     Archive.org ZIP shard extractor (ia_sstatic_basename_recovery.py)
+#
+# Security model (see docs/nas-worker.md):
+#   H1  non-root runtime user (Dockerfile USER worker + user: 10001:10001 here)
+#   H2  cap_drop: [ALL], security_opt: no-new-privileges; NO privileged, NO
+#       network_mode: host, NO Docker socket, NO device mounts, NO
+#       NET_ADMIN/NET_RAW (no capability is granted at all).
+#   H3  manifest + IA shard inputs are mounted READ-ONLY; only
+#       /work/state and /work/recovered are writable.
+#   H4  read_only: true root filesystem with /tmp as tmpfs.
+#   H5  no ports: section — the workers never listen.
+#
+# Host dirs come from .env (copy .env.example; never commit real values):
+#   MANIFEST_DIR (./manifests, :ro), IA_SHARDS_DIR (./ia-shards, :ro),
+#   STATE_DIR (./state, rw), RECOVERED_DIR (./recovered, rw).
+#
+# Usage:
+#   docker compose -f docker/image-worker/compose.yaml build
+#   docker compose -f docker/image-worker/compose.yaml run --rm so-image-worker \
+#       recover_convert_images.py --manifest /work/manifests/missing.tsv \
+#       --state-dir /work/state --out-dir /work/recovered --limit 10
+# (or via bin/run-worker cdn|ia ...)
+services:
+  so-image-worker:
+    build: .
+    image: so-image-worker:latest
+    restart: "no"
+    init: true
+    user: "10001:10001"
+    working_dir: /work
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      VIPS_CONCURRENCY: "2"
+    volumes:
+      - ${MANIFEST_DIR:-./manifests}:/work/manifests:ro
+      - ${STATE_DIR:-./state}:/work/state
+      - ${RECOVERED_DIR:-./recovered}:/work/recovered
+    command: ["recover_convert_images.py", "--help"]
+
+  so-ia-basename:
+    build: .
+    image: so-image-worker:latest
+    restart: "no"
+    init: true
+    user: "10001:10001"
+    working_dir: /work
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      VIPS_CONCURRENCY: "2"
+    volumes:
+      - ${IA_SHARDS_DIR:-./ia-shards}:/work/ia-shards:ro
+      - ${MANIFEST_DIR:-./manifests}:/work/manifests:ro
+      - ${STATE_DIR:-./state}:/work/state
+      - ${RECOVERED_DIR:-./recovered}:/work/recovered
+    command: ["ia_sstatic_basename_recovery.py", "--help"]

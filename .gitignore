@@ -4,9 +4,16 @@
 !.env.example
 secrets/
 *private-key*
+*private*key*
+*.key
 
-# WireGuard configs (tunnel used for CDN image recovery)
-.wg*.conf
+# WireGuard configs (tunnel used for CDN image recovery) — operator-managed
+# and NEVER committed; the repo contains no interface config or keys
+*.wg.conf
+wg*.conf
+wg0.conf
+wg3.conf
+.wg*
 
 # Working data — never commit
 data/stage/
@@ -33,3 +40,10 @@ __pycache__/
 node_modules/
 # Stage-1 forensic capture evidence
 capture/
+
+# Docker image worker working data — never commit
+# (fixture manifests, SQLite checkpoints, recovered images, IA shard mounts)
+docker/image-worker/manifests/
+docker/image-worker/state/
+docker/image-worker/recovered/
+docker/image-worker/ia-shards/
