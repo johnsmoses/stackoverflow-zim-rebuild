@@ -30,7 +30,6 @@ import http.client
 import io
 import ipaddress
 import os
-import re
 import shutil
 import socket
 import ssl
@@ -46,7 +45,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .config import CONNECT_TIMEOUT, RecoveryConfig
+from .config import CONNECT_TIMEOUT, Pathish, RecoveryConfig
 
 # --------------------------------------------------------------------------- #
 # constants (H3/H6)

@@ -1,8 +1,6 @@
 """upgrade_small_ia_images: upgrade candidate detection (larger + valid) and
 dry-run candidate emission. All offline (download is faked)."""
 
-import json
-
 from recovery.lib.config import RecoveryConfig
 from recovery.lib.manifest import ManifestWriter
 from recovery.lib.images import tiny_png_bytes
@@ -87,7 +85,7 @@ def test_dryrun_emits_candidates_without_network(tmp_path):
 
     lines = [line.rstrip("\n").split("\t") for line in
              open(out_manifest, encoding="utf-8") if line.strip()]
-    header, rows = lines[0], lines[1:]
+    rows = lines[1:]  # header line (lines[0]) not needed for row assertions
     assert len(rows) == 2
     assert all(row[6] == "candidate" for row in rows)  # status column
     assert {row[0] for row in rows} == {H1, H2}

@@ -10,6 +10,10 @@ patch_series:
   status: captured   # capture-pending | captured | applied
   directory: patches/sotoki/
   commit_count: 9
+  # H5: canonical tree hash of `git checkout 157ca9a` + `git am` of the
+  # 9 patches in series order (`git rev-parse HEAD^{tree}`). CI refuses to
+  # merge or release when the assembled tree drifts from this value.
+  tree_hash: 8bb0e3b9bf8e39e79304d1a111842a1885f42582
   implemented_features:
     - snapshot-aware incremental mode
   note: >

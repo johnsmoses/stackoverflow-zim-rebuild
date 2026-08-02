@@ -20,7 +20,7 @@ import html as htmlmod
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 #: any image hash reference in a staged page

@@ -17,9 +17,10 @@ import os
 import struct
 import zlib
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from .images import convert_to_webp, sha256_of
+from .config import Pathish
 
 DEFAULT_TEXT = "External visual asset unavailable"
 DEFAULT_SIZE = (320, 120)

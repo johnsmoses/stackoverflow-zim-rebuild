@@ -32,9 +32,10 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import recovery
+from recovery.lib.config import Pathish
 
 SCHEMA_VERSION = "1"
 TSV_FIELDS: Tuple[str, ...] = (

@@ -24,7 +24,6 @@ def _spec_with(sha):
 def test_is_placeholder_requires_size_and_sha(tmp_path):
     p = tmp_path / "img"
     p.write_bytes(b"\x00" * PLACEHOLDER_BYTES)
-    sha = "deadbeef" * 8  # content hash of b"\x00"*1852 is not this
 
     # size ok + matching sha -> True
     import hashlib

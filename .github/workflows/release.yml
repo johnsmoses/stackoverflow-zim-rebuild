@@ -1,0 +1,144 @@
+# Release workflow for stackoverflow-zim-rebuild (Task 10).
+#
+# Triggered by a tag push (v*). Before anything is published the job
+# re-verifies the whole reproducibility contract:
+#   H7  the tagged commit must be contained in origin/master
+#   H5  the 9-patch series must still assemble to the tree hash in
+#       sotoki.lock (no release on drift)
+#   H4  release assets come from an EXPLICIT allowlist — never recursive
+#       directories, never globs that can silently grow
+#   H6  a checksums.txt manifest over that exact allowlist is attached
+#   H2  contents: write is granted ONLY here (this release job), never in
+#       the CI workflow
+#
+# softprops/action-gh-release is pinned to an immutable commit SHA (H3);
+# the tag equivalent is noted in the comment. No WireGuard, no secrets,
+# no dump/IA corpus access anywhere in this workflow.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  verify-then-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # full history: needed for merge-base ancestry (H7)
+
+      - name: Verify tagged commit is contained in origin/master (H7)
+        run: |
+          git rev-parse "${GITHUB_SHA}" >/dev/null
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/master || {
+            echo "::error::tag commit ${GITHUB_SHA} is not an ancestor of origin/master; refusing to release"
+            exit 1
+          }
+          echo "OK: tag commit ${GITHUB_SHA} is contained in origin/master"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install gate dependencies
+        run: |
+          python -m pip install --quiet pyyaml \
+            zimscraperlib kiwixstorage beautifulsoup4 mistune \
+            python-slugify tld jinja2 jinja2-pluralize requests \
+            backoff psutil
+
+      - name: Clone upstream sotoki at pinned base commit
+        run: |
+          # Full clone (fetches all heads incl. the branch containing the
+          # base commit), then detach at the pinned SHA. GitHub does not
+          # allow fetching a bare SHA, so there is no separate fetch step.
+          git clone --quiet https://github.com/openzim/sotoki /tmp/sotoki
+          git -C /tmp/sotoki checkout --quiet 157ca9a1c73e3e6349f1c80bb03e058355aef743
+          test "$(git -C /tmp/sotoki rev-parse HEAD)" = "157ca9a1c73e3e6349f1c80bb03e058355aef743"
+
+      - name: Apply patch series in order (0001-0009)
+        run: |
+          cd /tmp/sotoki
+          git config user.name "CI patch-apply gate"
+          git config user.email "ci@stackoverflow-zim-rebuild.invalid"
+          git am --3way "$GITHUB_WORKSPACE"/patches/sotoki/*.patch
+
+      - name: Compare assembled tree hash against sotoki.lock (H5)
+        run: |
+          actual="$(git -C /tmp/sotoki rev-parse 'HEAD^{tree}')"
+          expected="$(python3 -c "import yaml; print(yaml.safe_load(open('sotoki.lock'))['patch_series']['tree_hash'])")"
+          echo "actual=${actual}"
+          echo "expected=${expected}"
+          test "${actual}" = "${expected}" || {
+            echo "::error::tree hash mismatch — patch series drifted from sotoki.lock; no release"
+            exit 1
+          }
+
+      - name: Stage explicit release assets (H4/H6)
+        run: |
+          set -euo pipefail
+          dist="${RUNNER_TEMP}/release-assets"
+          mkdir -p "${dist}"
+          # Explicit allowlist — add a file here ONLY when the release
+          # contract deliberately grows. No globs, no directories.
+          cp sotoki.lock "${dist}/sotoki.lock"
+          cp patches/sotoki/0001-Add-staging-assemble-resume-content-threads-CLI-opti.patch "${dist}/0001-Add-staging-assemble-resume-content-threads-CLI-opti.patch"
+          cp patches/sotoki/0002-Stage-rendered-questions-to-filesystem-with-manifest.patch "${dist}/0002-Stage-rendered-questions-to-filesystem-with-manifest.patch"
+          cp patches/sotoki/0003-Add-assemble-only-ZIM-builder-title-sanitization-sta.patch "${dist}/0003-Add-assemble-only-ZIM-builder-title-sanitization-sta.patch"
+          cp patches/sotoki/0004-Support-offline-asset-loading-and-Redis-less-tag-use.patch "${dist}/0004-Support-offline-asset-loading-and-Redis-less-tag-use.patch"
+          cp patches/sotoki/0005-Bound-sort-buffer-and-throttle-Redis-pipeline-flushe.patch "${dist}/0005-Bound-sort-buffer-and-throttle-Redis-pipeline-flushe.patch"
+          cp patches/sotoki/0006-Add-snapshot-aware-incremental-CLI-options-and-conte.patch "${dist}/0006-Add-snapshot-aware-incremental-CLI-options-and-conte.patch"
+          cp patches/sotoki/0007-Add-canonical-per-question-fingerprint-and-render-co.patch "${dist}/0007-Add-canonical-per-question-fingerprint-and-render-co.patch"
+          cp patches/sotoki/0008-Run-metadata-passes-and-prune-stale-pages-in-increme.patch "${dist}/0008-Run-metadata-passes-and-prune-stale-pages-in-increme.patch"
+          cp patches/sotoki/0009-Support-local-dump-archives-via-archive-dir.patch "${dist}/0009-Support-local-dump-archives-via-archive-dir.patch"
+          cp data/baseline-2026-07.json "${dist}/baseline-2026-07.json"
+          cp data/placeholder-spec.json "${dist}/placeholder-spec.json"
+          cp configs/expected-counts.json "${dist}/expected-counts.json"
+          cp CHANGELOG.md "${dist}/CHANGELOG.md"
+          # H6: checksums over the exact same explicit list, generated in
+          # the dist dir so filenames match the released artifact names.
+          cd "${dist}"
+          sha256sum \
+            sotoki.lock \
+            0001-Add-staging-assemble-resume-content-threads-CLI-opti.patch \
+            0002-Stage-rendered-questions-to-filesystem-with-manifest.patch \
+            0003-Add-assemble-only-ZIM-builder-title-sanitization-sta.patch \
+            0004-Support-offline-asset-loading-and-Redis-less-tag-use.patch \
+            0005-Bound-sort-buffer-and-throttle-Redis-pipeline-flushe.patch \
+            0006-Add-snapshot-aware-incremental-CLI-options-and-conte.patch \
+            0007-Add-canonical-per-question-fingerprint-and-render-co.patch \
+            0008-Run-metadata-passes-and-prune-stale-pages-in-increme.patch \
+            0009-Support-local-dump-archives-via-archive-dir.patch \
+            baseline-2026-07.json \
+            placeholder-spec.json \
+            expected-counts.json \
+            CHANGELOG.md > checksums.txt
+          echo "Release assets staged:"
+          ls -la "${dist}"
+          echo "dist_dir=${dist}" >> "${GITHUB_ENV}"
+
+      - name: Publish release (explicit asset list, never globs)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            ${{ env.dist_dir }}/sotoki.lock
+            ${{ env.dist_dir }}/0001-Add-staging-assemble-resume-content-threads-CLI-opti.patch
+            ${{ env.dist_dir }}/0002-Stage-rendered-questions-to-filesystem-with-manifest.patch
+            ${{ env.dist_dir }}/0003-Add-assemble-only-ZIM-builder-title-sanitization-sta.patch
+            ${{ env.dist_dir }}/0004-Support-offline-asset-loading-and-Redis-less-tag-use.patch
+            ${{ env.dist_dir }}/0005-Bound-sort-buffer-and-throttle-Redis-pipeline-flushe.patch
+            ${{ env.dist_dir }}/0006-Add-snapshot-aware-incremental-CLI-options-and-conte.patch
+            ${{ env.dist_dir }}/0007-Add-canonical-per-question-fingerprint-and-render-co.patch
+            ${{ env.dist_dir }}/0008-Run-metadata-passes-and-prune-stale-pages-in-increme.patch
+            ${{ env.dist_dir }}/0009-Support-local-dump-archives-via-archive-dir.patch
+            ${{ env.dist_dir }}/baseline-2026-07.json
+            ${{ env.dist_dir }}/placeholder-spec.json
+            ${{ env.dist_dir }}/expected-counts.json
+            ${{ env.dist_dir }}/CHANGELOG.md
+            ${{ env.dist_dir }}/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

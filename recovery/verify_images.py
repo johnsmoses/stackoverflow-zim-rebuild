@@ -22,7 +22,6 @@ to stderr. Exit code 0 on PASS, 1 on FAIL.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import random
 import re

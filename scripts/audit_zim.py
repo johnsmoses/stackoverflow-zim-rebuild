@@ -33,7 +33,6 @@ import argparse
 import datetime
 import json
 import os
-import re
 import shutil
 import struct
 import subprocess
